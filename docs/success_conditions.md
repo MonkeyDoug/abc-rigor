@@ -4,8 +4,9 @@
   `[5, 15]` seconds for each randomized episode. Keep the tray at least 5 cm
   above its initial height and the ball within the existing tray-local region
   for that duration without interruption. An invalid sample restarts the hold.
-  Once the hold completes, ignore the ball and require the tray to contact the
-  table on a subsequent sample. Completion is latched. Physics-step updates
+  Once the hold completes, ignore the ball and require a new tray–table contact
+  at a later timestamp. Existing contact or repeated evaluation of the same
+  timestamp does not count as lowering. Completion is latched. Physics-step updates
   prevent an interruption between control observations from being missed.
   `evaluate_model_data` uses simulation time; qpos-only callers must supply
   `time_s` explicitly.

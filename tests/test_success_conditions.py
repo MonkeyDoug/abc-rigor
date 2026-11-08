@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 import mujoco
+import numpy as np
 
 from abc_sim.task_eval.ball_tray import (
     BallTrayBalancingEvaluator,
@@ -83,6 +84,25 @@ class BallTrayTest(unittest.TestCase):
     def test_time_is_required_for_qpos_only_calls(self):
         with self.assertRaisesRegex(ValueError, "time_s"):
             self.evaluator.evaluate_qpos_batch(self.data.qpos[None, :])
+
+    def test_existing_contact_is_not_a_lowering_event(self):
+        address = int(self.model.jnt_qposadr[self.model.joint("ball_tray_joint").id])
+        self.data.qpos[address + 3 : address + 7] = [
+            np.cos(np.pi / 6),
+            np.sin(np.pi / 6),
+            0,
+            0,
+        ]
+        self.sample(1, lifted=True)
+        reached = self.sample(6, lifted=True)
+        self.assertTrue(reached.metrics["tray_table_contact"][0])
+        self.assertTrue(reached.metrics["hold_complete"][0])
+        self.assertFalse(reached.scalar_success())
+        self.assertFalse(self.sample(6, lifted=True).scalar_success())
+        self.assertFalse(self.sample(7, lifted=True).scalar_success())
+        self.data.qpos[address + 3 : address + 7] = [1, 0, 0, 0]
+        self.assertFalse(self.sample(8, lifted=True).scalar_success())
+        self.assertTrue(self.sample(9).scalar_success())
 
     def test_duration_sampling_is_reproducible_and_in_range(self):
         values = [sample_hold_duration_s(seed) for seed in range(100)]

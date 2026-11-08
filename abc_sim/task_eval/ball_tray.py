@@ -72,7 +72,9 @@ class BallTrayBalancingEvaluator:
         self._hold_started_at = np.full(self._nworld, np.nan)
         self._last_time_s = np.full(self._nworld, np.nan)
         self._hold_complete = np.zeros(self._nworld, dtype=bool)
+        self._hold_completed_at = np.full(self._nworld, np.nan)
         self._completed_hold_s = np.zeros(self._nworld, dtype=np.float64)
+        self._last_table_contact = np.zeros(self._nworld, dtype=bool)
         self._completed = np.zeros(self._nworld, dtype=bool)
         self._rest_tray_z: np.ndarray | None = None
 
@@ -236,10 +238,14 @@ class BallTrayBalancingEvaluator:
         self._hold_complete |= valid_hold & (elapsed >= self._hold_duration_s)
         just_held = self._hold_complete & ~ready_to_lower
         self._completed_hold_s[just_held] = elapsed[just_held]
+        self._hold_completed_at[just_held] = now[just_held]
         elapsed = np.where(self._hold_complete, self._completed_hold_s, elapsed)
-        self._completed |= ready_to_lower & np.asarray(
-            metrics["tray_table_contact"], dtype=bool
+        table_contact = np.asarray(metrics["tray_table_contact"], dtype=bool)
+        new_contact = table_contact & ~self._last_table_contact
+        self._completed |= (
+            ready_to_lower & (now > self._hold_completed_at) & new_contact
         )
+        self._last_table_contact = table_contact.copy()
         progress = np.clip(elapsed / self._hold_duration_s, 0.0, 1.0)
         reward = np.where(
             self._completed, 1.0, np.where(self._hold_complete, 0.9, 0.9 * progress)
