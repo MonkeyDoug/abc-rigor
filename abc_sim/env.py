@@ -539,6 +539,8 @@ class MuJoCoYAMEnv(gym.Env):
                 if after_step is not None:
                     after_step(self.model, self.data)
                 self._sync_prompt_from_task_runtime()
+            if getattr(self._task_evaluator, "requires_step_updates", False):
+                self._task_evaluator.evaluate_model_data(self.model, self.data)
 
     def _sync_prompt_from_task_runtime(self) -> None:
         """Adopt a runtime-owned prompt when the task exposes one."""

@@ -8,6 +8,8 @@ from typing import Any
 import mujoco
 import numpy as np
 
+from abc_sim.task_eval.ball_tray import BallTrayBalancingEvaluator
+from abc_sim.task_specs import get_task_spec
 
 _DEFAULT_DURATION_S = 12
 _HOLD_TO_START_S = 0.0
@@ -54,6 +56,8 @@ class BallTrayBalancingRuntime:
         self._applied_world_force_n = np.zeros(3, dtype=np.float64)
         self._perturbation_count = 0
         self._last_perturbation_force_n = 0.0
+        self._balance_evaluator: BallTrayBalancingEvaluator | None = None
+        self._balance_result = None
 
     def bind(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
         """Refresh cached model indices after a model swap."""
@@ -76,6 +80,9 @@ class BallTrayBalancingRuntime:
         tray_site_id = self._optional_site_id(model, _TRAY_CENTER_SITE)
         self._tray_center_site_id = tray_site_id if tray_site_id >= 0 else None
         self._applied_world_force_n[:] = 0.0
+        self._balance_evaluator = BallTrayBalancingEvaluator(
+            model=model, spec=get_task_spec("ball_tray_balancing")
+        )
 
     def after_reset(
         self,
@@ -86,7 +93,12 @@ class BallTrayBalancingRuntime:
     ) -> None:
         """Reset countdown state and load the randomized balance duration."""
 
-        self._duration_s = self._duration_from_randomization(randomization)
+        assert self._balance_evaluator is not None
+        self._balance_evaluator.reset(nworld=1)
+        if randomization is not None:
+            self._balance_evaluator.configure_from_randomization(model, randomization)
+        self._balance_result = self._balance_evaluator.evaluate_model_data(model, data)
+        self._duration_s = float(self._balance_result.metrics["hold_duration_s"][0])
         self._started_at_s = None
         self._deadline_s = None
         self._grip_detected_at_s = None
@@ -124,6 +136,8 @@ class BallTrayBalancingRuntime:
         """Update the countdown after MuJoCo has produced contact data."""
 
         now_s = float(data.time)
+        assert self._balance_evaluator is not None
+        self._balance_result = self._balance_evaluator.evaluate_model_data(model, data)
         self._contacted_handles = self._detect_gripper_handle_contacts(model, data)
         both_posts_gripped = self._both_posts_gripped(self._contacted_handles)
         if both_posts_gripped:
@@ -154,8 +168,10 @@ class BallTrayBalancingRuntime:
         return {
             "state": self._state,
             "display_prompt": self._display_prompt,
-            "duration_s": int(self._duration_s),
-            "remaining_s": None if self._remaining_s is None else float(self._remaining_s),
+            "duration_s": float(self._duration_s),
+            "remaining_s": None
+            if self._remaining_s is None
+            else float(self._remaining_s),
             "started": self._started_at_s is not None,
             "complete": self._state == "complete",
             "both_posts_gripped": self._both_posts_gripped(self._contacted_handles),
@@ -208,19 +224,6 @@ class BallTrayBalancingRuntime:
             if int(model.geom_bodyid[geom_id]) in body_ids
         }
 
-    @staticmethod
-    def _duration_from_randomization(randomization: Any = None) -> int:
-        metadata = getattr(randomization, "metadata", None)
-        if not isinstance(metadata, dict):
-            return _DEFAULT_DURATION_S
-        raw_duration = metadata.get("balance_duration_s")
-        if raw_duration is None:
-            return _DEFAULT_DURATION_S
-        duration = int(raw_duration)
-        if duration < 1:
-            return _DEFAULT_DURATION_S
-        return duration
-
     def _detect_gripper_handle_contacts(
         self,
         model: mujoco.MjModel,
@@ -241,8 +244,7 @@ class BallTrayBalancingRuntime:
                 elif geom2 in gripper_geoms and geom1 in handle_by_geom_id:
                     contacts[side].add(handle_by_geom_id[geom1])
         return {
-            side: tuple(sorted(handle_names))
-            for side, handle_names in contacts.items()
+            side: tuple(sorted(handle_names)) for side, handle_names in contacts.items()
         }
 
     def _maybe_schedule_perturbation(
@@ -257,7 +259,9 @@ class BallTrayBalancingRuntime:
             or self._tray_center_site_id is None
         ):
             return
-        if now_s >= self._deadline_s:
+        if self._balance_result is not None and bool(
+            self._balance_result.metrics["hold_complete"][0]
+        ):
             self._active_perturbation_until_s = None
             return
         if not handles_held:
@@ -291,9 +295,7 @@ class BallTrayBalancingRuntime:
                         *_PERTURBATION_DIRECTION_JITTER_RANGE_RAD,
                     )
                 )
-        force_n = float(
-            self._perturbation_rng.uniform(*_PERTURBATION_FORCE_RANGE_N)
-        )
+        force_n = float(self._perturbation_rng.uniform(*_PERTURBATION_FORCE_RANGE_N))
         self._active_local_force_n[:] = force_n * np.array(
             [
                 np.cos(self._perturbation_direction_rad),
@@ -341,21 +343,21 @@ class BallTrayBalancingRuntime:
         )
 
     def _update_display(self, now_s: float, both_posts_gripped: bool) -> None:
-        if self._deadline_s is not None:
-            remaining_s = max(0.0, self._deadline_s - now_s)
-            self._remaining_s = remaining_s
-            if remaining_s <= 0.0:
-                self._state = "complete"
-                self._display_prompt = "Balance complete"
-            else:
-                self._state = "counting_down"
-                self._display_prompt = f"Balance: {int(math.ceil(remaining_s))}s"
+        if self._balance_result is None:
             return
-
-        self._remaining_s = float(self._duration_s)
-        if both_posts_gripped and self._grip_detected_at_s is not None:
-            self._state = "starting"
-            self._display_prompt = "Hold both tray handles"
+        metrics = self._balance_result.metrics
+        self._remaining_s = max(
+            0.0, self._duration_s - float(metrics["continuous_hold_s"][0])
+        )
+        if self._balance_result.scalar_success():
+            self._state = "complete"
+            self._display_prompt = "Task complete"
+        elif bool(metrics["hold_complete"][0]):
+            self._state = "lowering"
+            self._display_prompt = "Lower the tray onto the table"
+        elif bool(metrics["lifted"][0]) and bool(metrics["current_balanced"][0]):
+            self._state = "counting_down"
+            self._display_prompt = f"Balance: {math.ceil(self._remaining_s)}s"
         else:
-            self._state = "waiting_for_handles"
-            self._display_prompt = "Grab both tray handles"
+            self._state = "waiting_for_lift"
+            self._display_prompt = "Lift the tray and keep the ball on it"

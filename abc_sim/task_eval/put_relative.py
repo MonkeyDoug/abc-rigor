@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 import mujoco
 import numpy as np
@@ -42,7 +43,7 @@ class PutRelativeEvaluator:
         *,
         model: mujoco.MjModel,
         spec: SimTaskSpec,
-        along_min_m: float = 0.06,
+        along_min_m: float = 0.0,
         along_max_m: float = 0.30,
         perp_max_m: float = 0.08,
         placed_z_tolerance_m: float = 0.03,
@@ -102,7 +103,9 @@ class PutRelativeEvaluator:
                 spawn_z = float(state["pos"][2])
 
         self._goal = {
-            "mover_adr": self._resolve_free_joint_qpos_adr(self.model, f"{mover}_joint"),
+            "mover_adr": self._resolve_free_joint_qpos_adr(
+                self.model, f"{mover}_joint"
+            ),
             "reference_adr": self._resolve_free_joint_qpos_adr(
                 self.model, f"{reference}_joint"
             ),

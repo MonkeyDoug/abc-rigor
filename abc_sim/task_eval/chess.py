@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 import mujoco
 import numpy as np
@@ -13,39 +14,33 @@ from abc_sim.task_eval.bottles import _quat_to_rotmat_batch
 from abc_sim.task_specs import SimTaskSpec
 
 
+def _matched_pieces(ok: np.ndarray, distances: np.ndarray) -> np.ndarray:
+    owners = np.full(ok.shape[1], -1, dtype=np.int32)
+
+    def assign(piece: int, visited: set[int]) -> bool:
+        for goal in np.argsort(distances[piece]):
+            goal = int(goal)
+            if not ok[piece, goal] or goal in visited:
+                continue
+            visited.add(goal)
+            if owners[goal] < 0 or assign(int(owners[goal]), visited):
+                owners[goal] = piece
+                return True
+        return False
+
+    for piece in range(ok.shape[0]):
+        assign(piece, set())
+    return owners[owners >= 0]
+
+
 class ChessBoardSetupEvaluator:
-    """Score set_up_chess_pieces by the target pieces standing on their squares.
+    """Require the complete board setup, allowing same-color/type exchanges.
 
-    Every reset the randomizer picks 5-10 target pieces, displaces them (onto
-    the table, knocked near their squares, or into the tin), leaves the rest
-    standing on their home squares, and records in its metadata exactly what
-    finishing looks like: ``target_joints`` and each one's board pose in
-    ``target_poses``. The evaluator adopts those, converting every goal into
-    the *board's own frame* from the recorded board spawn pose -- the board is
-    a free body the arms can nudge, so a piece is judged against the square
-    under it now, not where that square was at reset.
-
-    Identical pieces are interchangeable: the demonstrations put *a* black
-    pawn on each vacated pawn square, not the specific pawn the randomizer
-    happened to displace, and identity-keyed goals would fail a third of them
-    for swaps no observer could see. Targets are therefore matched to their
-    class's goal squares (nearest first within e.g. the displaced black
-    pawns) before scoring. A matched piece counts as placed when it sits
-    within ``position_tolerance_m`` of the square centre *in the board
-    plane*, within ``height_tolerance_m`` along the board's normal, and
-    standing up (``upright_z_min``): a piece lying across the right square is
-    knocked over, not set up. The board's free-joint frame is not z-up, so
-    the plane/normal split comes from the recorded spawn orientation (the
-    board-local direction that pointed at world up), not from axis indices.
-    Success is every target placed at once; ``ever_success`` latches for
-    eval_policy's early-stop, and the metrics carry how many non-target
-    pieces have strayed from their recorded poses so a rollout that
-    bulldozes the rest of the board while placing its targets is at least
-    visible.
-
-    Until the first reset hands over metadata there is no target set to
-    score, so the evaluator reports failure alongside ``goal_configured:
-    False`` rather than guessing one.
+    All model pieces must stand upright on distinct matching home squares,
+    including pieces outside the randomizer's displaced target subset.
+    Goals follow the board's current pose. A maximum-cardinality matching
+    within each color/type class avoids rejecting a valid exchange because
+    a nearest-first assignment consumed another piece's only valid square.
     """
 
     def __init__(
@@ -94,9 +89,12 @@ class ChessBoardSetupEvaluator:
             metadata = randomization.get("metadata")
         if not isinstance(metadata, Mapping):
             return
-        target_joints = metadata.get("target_joints")
-        target_poses = metadata.get("target_poses")
-        if not target_joints or not isinstance(target_poses, Mapping):
+        target_joints = metadata.get("target_joints") or []
+        target_poses = metadata.get("target_poses") or {}
+        board_poses = metadata.get("board_target_poses") or {}
+        if not isinstance(target_poses, Mapping) or not isinstance(
+            board_poses, Mapping
+        ):
             return
 
         object_states = getattr(randomization, "object_states", None)
@@ -124,35 +122,23 @@ class ChessBoardSetupEvaluator:
         joints: list[str] = []
         addrs: list[int] = []
         goals_board: list[np.ndarray] = []
-        for joint_name in target_joints:
-            pose = target_poses.get(joint_name)
+        all_joints = sorted(
+            joint.name
+            for joint in (model.jnt(i) for i in range(model.njnt))
+            if joint.name and re.fullmatch(r"(black|white)_[a-z]+_\d+_jnt", joint.name)
+        )
+        if not all_joints:
+            raise ValueError("No chess piece joints found")
+        for joint_name in all_joints:
+            pose = board_poses.get(joint_name) or target_poses.get(joint_name)
+            if pose is None and joint_name not in target_joints:
+                pose = object_states.get(joint_name)
             if not isinstance(pose, Mapping) or "pos" not in pose:
-                raise ValueError(
-                    f"target_poses is missing a pose for target {joint_name!r}"
-                )
+                raise ValueError(f"Missing home pose for chess piece {joint_name!r}")
             joints.append(str(joint_name))
             addrs.append(self._resolve_free_joint_qpos_adr(self.model, str(joint_name)))
             world = np.asarray(pose["pos"], dtype=np.float64)
             goals_board.append(rot_world_from_board.T @ (world - board_pos))
-
-        non_targets = [
-            str(name)
-            for name in (metadata.get("non_target_pieces") or [])
-            if isinstance(name, str)
-        ]
-        non_target_addrs = []
-        non_target_goals = []
-        board_poses = metadata.get("board_target_poses")
-        if isinstance(board_poses, Mapping):
-            for joint_name in non_targets:
-                pose = board_poses.get(joint_name)
-                if not isinstance(pose, Mapping) or "pos" not in pose:
-                    continue
-                non_target_addrs.append(
-                    self._resolve_free_joint_qpos_adr(self.model, joint_name)
-                )
-                world = np.asarray(pose["pos"], dtype=np.float64)
-                non_target_goals.append(rot_world_from_board.T @ (world - board_pos))
 
         classes = [re.sub(r"_\d+_jnt$", "", name) for name in joints]
         self._directive = {
@@ -161,12 +147,10 @@ class ChessBoardSetupEvaluator:
             "normal_local": normal_local,
             "addrs": np.asarray(addrs, dtype=np.int32),
             "goals_board": np.asarray(goals_board, dtype=np.float64),
-            "non_target_addrs": np.asarray(non_target_addrs, dtype=np.int32),
-            "non_target_goals": (
-                np.asarray(non_target_goals, dtype=np.float64)
-                if non_target_goals
-                else np.zeros((0, 3), dtype=np.float64)
-            ),
+            "selected_target_count": len(target_joints),
+            "non_target_indices": [
+                i for i, name in enumerate(joints) if name not in target_joints
+            ],
             "scenario": str(metadata.get("scenario", "")),
         }
 
@@ -203,14 +187,13 @@ class ChessBoardSetupEvaluator:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Per piece: (on-a-matched-square mask, upright mask).
 
-        With ``classes`` given, pieces are first matched greedily (nearest
-        planar distance) to the goal squares of their own class, so
-        interchangeable pieces score wherever their kind belongs.
+        With ``classes`` given, find a maximum matching over valid placements
+        within each class.
         """
 
-        pos = np.stack(
-            [qpos_batch[:, adr : adr + 3] for adr in addrs], axis=1
-        ).astype(np.float64)
+        pos = np.stack([qpos_batch[:, adr : adr + 3] for adr in addrs], axis=1).astype(
+            np.float64
+        )
         quat = np.stack(
             [qpos_batch[:, adr + 3 : adr + 7] for adr in addrs], axis=1
         ).astype(np.float64)
@@ -240,18 +223,8 @@ class ChessBoardSetupEvaluator:
                     ok = (planar <= self.position_tolerance_m) & (
                         np.abs(height) <= self.height_tolerance_m
                     )
-                    # greedy nearest-first assignment
-                    order = np.argsort(planar, axis=None)
-                    used_piece = np.zeros(len(idx), dtype=bool)
-                    used_goal = np.zeros(len(idx), dtype=bool)
-                    for flat in order:
-                        pi, gi = divmod(int(flat), len(idx))
-                        if used_piece[pi] or used_goal[gi]:
-                            continue
-                        used_piece[pi] = True
-                        used_goal[gi] = True
-                        if ok[pi, gi]:
-                            in_square[b, idx[pi]] = True
+                    for piece in _matched_pieces(ok, planar):
+                        in_square[b, idx[piece]] = True
 
         rot = _quat_to_rotmat_batch(quat.reshape(-1, 4).astype(np.float32))
         upright = rot[:, 2, 2].reshape(batch, count) >= self.upright_z_min
@@ -302,18 +275,9 @@ class ChessBoardSetupEvaluator:
         success = num_placed == target_count
         self._ever_success |= success
 
-        if len(directive["non_target_addrs"]):
-            nt_in, nt_up = self._piece_placement(
-                qpos_batch,
-                directive["non_target_addrs"],
-                directive["non_target_goals"],
-                rot_board_from_world,
-                board_pos,
-                directive["normal_local"],
-            )
-            num_non_target_disturbed = (~(nt_in & nt_up)).sum(axis=1).astype(np.int32)
-        else:
-            num_non_target_disturbed = np.zeros((batch,), dtype=np.int32)
+        num_non_target_disturbed = (
+            (~placed[:, directive["non_target_indices"]]).sum(axis=1).astype(np.int32)
+        )
 
         placed_names = [
             [name for name, ok in zip(directive["joints"], world) if bool(ok)]
@@ -326,6 +290,9 @@ class ChessBoardSetupEvaluator:
                 "goal_configured": True,
                 "scenario": directive["scenario"],
                 "target_count": target_count,
+                "piece_count": target_count,
+                "selected_target_count": directive["selected_target_count"],
+                "num_pieces_placed": num_placed,
                 "num_targets_placed": num_placed,
                 "targets_placed": placed_names,
                 "num_non_target_disturbed": num_non_target_disturbed,
