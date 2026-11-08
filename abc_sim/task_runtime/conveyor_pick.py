@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import os
+
 import mujoco
 import numpy as np
 
@@ -39,6 +41,10 @@ REMOVED_OBJECT_X = 3.0
 REMOVED_OBJECT_MIN_X = 2.0
 _REMOVED_OBJECT_SPACING_Y = 0.5
 _REMOVED_OBJECT_DROP_Z = 0.2
+# Diagnostic: with ABC_CONVEYOR_HOLD_UNTIL_MOTION=1 the belt stays still until the robot's first commanded motion (an
+# arm or gripper target leaves the value it held on the first physics step), i.e. until the opening reasoning is done.
+_HOLD_UNTIL_MOTION = os.environ.get("ABC_CONVEYOR_HOLD_UNTIL_MOTION") == "1"
+_MOTION_THRESHOLD = 1e-3
 
 
 class ConveyorPickRuntime:
@@ -52,6 +58,8 @@ class ConveyorPickRuntime:
         self._last_active_objects: tuple[int, ...] = ()
         self._removed_objects: tuple[int, ...] = ()
         self._belt_speed_y = _DEFAULT_BELT_SPEED_Y
+        self._held_ctrl: np.ndarray | None = None
+        self._belt_started_at: float | None = None
 
     def bind(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
         """Reset cached model indices after a model/data change."""
@@ -74,6 +82,8 @@ class ConveyorPickRuntime:
 
         self._last_active_objects = ()
         self._removed_objects = ()
+        self._held_ctrl = None
+        self._belt_started_at = None if _HOLD_UNTIL_MOTION else 0.0
         self._belt_speed_y = self._speed_from_randomization(randomization)
         self._open_idle_grippers(model, data)
         mujoco.mj_forward(model, data)
@@ -81,8 +91,21 @@ class ConveyorPickRuntime:
     def before_step(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
         """Apply conveyor controls before each MuJoCo physics step."""
 
+        rollers = self._roller_actuators_for(model)
+        if self._belt_started_at is None:
+            arm = np.setdiff1d(np.arange(model.nu), rollers)
+            if self._held_ctrl is None:
+                self._held_ctrl = data.ctrl[arm].copy()
+            elif np.max(np.abs(data.ctrl[arm] - self._held_ctrl), initial=0.0) > _MOTION_THRESHOLD:
+                self._belt_started_at = float(data.time)
+                print(f"CONVEYOR_BELT_STARTED sim_time={self._belt_started_at:.3f}", flush=True)
+        if self._belt_started_at is None:
+            for actuator_id in rollers:
+                data.ctrl[actuator_id] = 0.0
+            return
+
         roller_speed = self._roller_speed()
-        for actuator_id in self._roller_actuators_for(model):
+        for actuator_id in rollers:
             data.ctrl[actuator_id] = roller_speed
 
         active_objects: list[int] = []
@@ -131,6 +154,7 @@ class ConveyorPickRuntime:
         return {
             "active_objects": self._last_active_objects,
             "removed_objects": self._removed_objects,
+            "belt_started_at": self._belt_started_at,
             "belt_speed_y": self._belt_speed_y,
             "belt_speed_m_s": abs(self._belt_speed_y),
             "belt_direction_y": float(np.sign(self._belt_speed_y)),
