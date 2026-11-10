@@ -1,7 +1,10 @@
 # Revised success conditions
 
-- **Ball tray:** sample and record one continuous uniform hold duration in
-  `[5, 15]` seconds for each randomized episode. Keep the tray at least 5 cm
+- **Ball tray:** sample uniformly from `[5, 15.5)` seconds, then round down to
+  the nearest half-second. The 21 requirements from 5 through 15 seconds are
+  equally likely. Record this duration and use it for both scoring and the
+  episode prompt: `balance the ball in the tray for at least X seconds`.
+  Format whole seconds without `.0`. Keep the tray at least 5 cm
   above its initial height and the ball within the existing tray-local region
   for that duration without interruption. An invalid sample restarts the hold.
   Once the hold completes, ignore the ball and require a new tray–table contact
@@ -14,6 +17,8 @@
   outside the displaced target subset. Pieces of the same color and type are
   interchangeable across that entire set. Match valid placements one-to-one;
   retain the existing board-relative position, height, and upright tolerances.
+  In both chess scenes, swap the pieces' dark and light materials while
+  preserving their names, positions, meshes, and evaluator identities.
 - **Relative placement:** allow zero separation along the requested direction.
   Keep the 30 cm upper limit, 8 cm perpendicular limit, and existing placement
   height check.

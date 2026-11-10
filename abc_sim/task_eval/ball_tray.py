@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import mujoco
 import numpy as np
 
@@ -11,8 +13,13 @@ from abc_sim.task_specs import SimTaskSpec
 
 
 def sample_hold_duration_s(seed: int | None) -> float:
-    """A reproducible uniform hold requirement for a randomized episode."""
-    return float(np.random.default_rng(seed).uniform(5.0, 15.0))
+    """Uniformly sample the 21 half-second requirements from 5 through 15."""
+    sampled = float(np.random.default_rng(seed).uniform(5.0, 15.5))
+    return math.floor(sampled * 2.0) / 2.0
+
+
+def format_hold_prompt(duration_s: float) -> str:
+    return f"balance the ball in the tray for at least {duration_s:g} seconds"
 
 
 class BallTrayBalancingEvaluator:

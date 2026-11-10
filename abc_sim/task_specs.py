@@ -182,8 +182,8 @@ _TASK_SPECS: tuple[SimTaskSpec, ...] = (
     SimTaskSpec(
         name="ball_tray_balancing",
         env_task="ball_tray_balancing",
-        prompt="lift the tray, keep the ball balanced for the required duration, then lower the tray onto the table",
-        description="Hold the lifted tray with the ball balanced for a sampled 5–15 seconds, then return the tray to table contact.",
+        prompt="balance the ball in the tray for at least 12 seconds",
+        description="Hold the lifted tray with the ball balanced for a sampled 5–15 seconds in half-second increments, then return the tray to table contact.",
         evaluator_name="ball_tray_balancing",
         aliases=(
             "ball tray balancing",

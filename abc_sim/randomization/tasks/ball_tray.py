@@ -5,7 +5,7 @@ from typing import Any, ClassVar
 import mujoco
 import numpy as np
 
-from abc_sim.task_eval.ball_tray import sample_hold_duration_s
+from abc_sim.task_eval.ball_tray import format_hold_prompt, sample_hold_duration_s
 
 from ..core import PerturbRange, RandomizationState, SceneRandomizer
 
@@ -25,7 +25,6 @@ _BALL_TRAY_SPAWN_Y_RANGE_M = (0.0, 0.0)
 _BALL_TRAY_LINEAR_VELOCITY_RANGE_M_S = (0.0, 0.0)
 _BALL_TRAY_ANGULAR_VELOCITY_RANGE_RAD_S = (0.0, 0.0)
 _BALL_TRAY_COUNTDOWN_DURATION_RANGE_S = (5.0, 15.0)
-_BALL_TRAY_PROMPT = "lift the tray, keep the ball balanced for the required duration, then lower the tray onto the table"
 
 
 class BallTrayBalancingRandomizer(SceneRandomizer):
@@ -141,7 +140,7 @@ class BallTrayBalancingRandomizer(SceneRandomizer):
                 _BALL_TRAY_BALL_JOINT: ball_scale,
             },
             metadata={
-                "prompt": _BALL_TRAY_PROMPT,
+                "prompt": format_hold_prompt(balance_duration_s),
                 "prompt_type": "ball_tray_balancing",
                 "ball_body": _BALL_TRAY_BALL_BODY,
                 "ball_joint": _BALL_TRAY_BALL_JOINT,

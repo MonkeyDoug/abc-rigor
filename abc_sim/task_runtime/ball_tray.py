@@ -8,7 +8,7 @@ from typing import Any
 import mujoco
 import numpy as np
 
-from abc_sim.task_eval.ball_tray import BallTrayBalancingEvaluator
+from abc_sim.task_eval.ball_tray import BallTrayBalancingEvaluator, format_hold_prompt
 from abc_sim.task_specs import get_task_spec
 
 _DEFAULT_DURATION_S = 12
@@ -31,7 +31,7 @@ _GRIPPER_ROOT_BODIES = {
 
 
 class BallTrayBalancingRuntime:
-    """Start a visible balance countdown once both grippers hold both tray posts."""
+    """Keep the duration prompt fixed while displaying hold-and-lower progress."""
 
     def __init__(self) -> None:
         self._gripper_geom_ids: dict[str, set[int]] = {"left": set(), "right": set()}
@@ -44,8 +44,8 @@ class BallTrayBalancingRuntime:
         self._grip_detected_at_s: float | None = None
         self._last_both_handles_contact_at_s: float | None = None
         self._remaining_s: float | None = None
-        self._display_prompt = "Grab both tray handles"
-        self._state = "waiting_for_handles"
+        self._display_prompt = format_hold_prompt(self._duration_s)
+        self._state = "waiting_for_lift"
         self._contacted_handles: dict[str, tuple[str, ...]] = {"left": (), "right": ()}
         self._perturbation_rng = np.random.default_rng(0)
         self._next_perturbation_at_s: float | None = None
@@ -104,8 +104,8 @@ class BallTrayBalancingRuntime:
         self._grip_detected_at_s = None
         self._last_both_handles_contact_at_s = None
         self._remaining_s = float(self._duration_s)
-        self._display_prompt = "Grab both tray handles"
-        self._state = "waiting_for_handles"
+        self._display_prompt = format_hold_prompt(self._duration_s)
+        self._state = "waiting_for_lift"
         self._contacted_handles = {"left": (), "right": ()}
         seed = int(getattr(randomization, "seed", 0) or 0)
         self._perturbation_rng = np.random.default_rng(seed)
@@ -126,6 +126,10 @@ class BallTrayBalancingRuntime:
             data.xfrc_applied[self._ball_body_id, :3] = 0.0
         self._perturbation_count = 0
         self._last_perturbation_force_n = 0.0
+
+    def observation_prompt(self) -> str:
+        """Use the episode's required duration throughout the policy rollout."""
+        return format_hold_prompt(self._duration_s)
 
     def before_step(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
         """Apply an active perturbation as an additive external force."""
@@ -360,4 +364,4 @@ class BallTrayBalancingRuntime:
             self._display_prompt = f"Balance: {math.ceil(self._remaining_s)}s"
         else:
             self._state = "waiting_for_lift"
-            self._display_prompt = "Lift the tray and keep the ball on it"
+            self._display_prompt = self.observation_prompt()

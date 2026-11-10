@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import mujoco
 import numpy as np
 
+from abc_sim.randomization.tasks.ball_tray import BallTrayBalancingRandomizer
 from abc_sim.task_eval.ball_tray import (
     BallTrayBalancingEvaluator,
     sample_hold_duration_s,
@@ -111,18 +112,56 @@ class BallTrayTest(unittest.TestCase):
         self.assertLess(min(values), 6)
         self.assertGreater(max(values), 14)
 
+    def test_half_second_requirements_are_uniform_including_both_endpoints(self):
+        values = np.asarray([sample_hold_duration_s(seed) for seed in range(21000)])
+        durations, counts = np.unique(values, return_counts=True)
+        np.testing.assert_array_equal(durations, np.arange(5.0, 15.5, 0.5))
+        # Fixed seeds keep this reproducible; the generous bounds catch biased
+        # endpoint buckets without requiring an exact random frequency.
+        self.assertTrue(np.all((counts > 800) & (counts < 1200)), counts)
+
+    def test_randomized_prompt_matches_evaluator_and_runtime_duration(self):
+        randomizer = BallTrayBalancingRandomizer()
+        runtime = BallTrayBalancingRuntime()
+        runtime.bind(self.model, self.data)
+        for seed in (0, 1, 4):
+            with self.subTest(seed=seed):
+                state = randomizer.randomize(self.model, self.data, seed=seed)
+                duration = state.metadata["hold_duration_s"]
+                prompt = (
+                    f"balance the ball in the tray for at least {duration:g} seconds"
+                )
+                self.assertEqual(state.metadata["prompt"], prompt)
+                self.assertEqual(state.metadata["balance_duration_s"], duration)
+                self.evaluator.reset()
+                self.evaluator.configure_from_randomization(self.model, state)
+                result = self.evaluator.evaluate_model_data(self.model, self.data)
+                self.assertEqual(result.metrics["hold_duration_s"][0], duration)
+                runtime.after_reset(self.model, self.data, randomization=state)
+                self.assertEqual(runtime.observation_prompt(), prompt)
+                self.assertEqual(runtime.debug_state()["display_prompt"], prompt)
+                runtime.after_step(self.model, self.data)
+                self.assertEqual(runtime.observation_prompt(), prompt)
+
     def test_runtime_prompts_wait_for_lowering(self):
         runtime = BallTrayBalancingRuntime()
         runtime.bind(self.model, self.data)
         runtime.after_reset(self.model, self.data, randomization=self.randomization)
+        prompt = "balance the ball in the tray for at least 5 seconds"
+        self.assertEqual(runtime.observation_prompt(), prompt)
         for timestamp in (1, 6):
             self.sample(timestamp, lifted=True)
             runtime.after_step(self.model, self.data)
+            self.assertEqual(runtime.observation_prompt(), prompt)
         self.assertEqual(runtime.debug_state()["state"], "lowering")
         self.assertFalse(runtime.debug_state()["complete"])
+        self.assertEqual(
+            runtime.debug_state()["display_prompt"], "Lower the tray onto the table"
+        )
         self.sample(7, ball_inside=False)
         runtime.after_step(self.model, self.data)
         self.assertTrue(runtime.debug_state()["complete"])
+        self.assertEqual(runtime.observation_prompt(), prompt)
 
 
 class ChessTest(unittest.TestCase):
