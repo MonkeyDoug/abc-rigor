@@ -36,6 +36,24 @@ def position(model, data, joint, xyz):
     data.qpos[address : address + 3] = xyz
 
 
+def make_test_env(test, model, task):
+    directory = tempfile.TemporaryDirectory()
+    test.addCleanup(directory.cleanup)
+    scene = Path(directory.name) / "scene.xml"
+    mujoco.mj_saveLastXML(str(scene), model)
+    env = MuJoCoYAMEnv(
+        config=RobotSystemConfig(),
+        render_cameras=False,
+        scene_xml=scene,
+        control_decimation=1,
+    )
+    test.addCleanup(env.close)
+    env.set_task(task)
+    with mock.patch.object(env, "get_init_q", return_value=np.empty(0)):
+        env.reset(randomize=False)
+    return env
+
+
 class BallTrayTest(unittest.TestCase):
     def setUp(self):
         self.model = mujoco.MjModel.from_xml_string(
@@ -283,6 +301,36 @@ class BallTrayTest(unittest.TestCase):
                 self.assertEqual(score.call_count, 7)
                 self.assertIs(env._task_runtime._balance_result, env._step_task_eval)
 
+    def test_env_preserves_hold_during_synchronized_tray_and_ball_motion(self):
+        env = make_test_env(self, self.model, "ball_tray_balancing")
+        env.model.opt.gravity[:] = 0
+        env.model.geom_contype[:] = 0
+        env.model.geom_conaffinity[:] = 0
+        position(env.model, env.data, "ball_tray_joint", [0, 0, 0.109])
+        position(env.model, env.data, "ball_tray_ball_joint", [0.125, 0, 0.139])
+        for name in ("ball_tray_joint", "ball_tray_ball_joint"):
+            dof = int(env.model.joint(name).dofadr[0])
+            env.data.qvel[dof] = 1.0
+        env.data.time = 1.0
+        mujoco.mj_forward(env.model, env.data)
+        env._update_step_task_eval()
+
+        env.advance_physics(steps=3)
+
+        live = env._step_task_eval
+        self.assertTrue(live.metrics["current_balanced"][0])
+        self.assertTrue(live.metrics["lifted"][0])
+        self.assertAlmostEqual(live.metrics["continuous_hold_s"][0], 0.006)
+        self.assertAlmostEqual(live.metrics["ball_tray_local_pos"][0, 0], 0.125)
+        fresh = env._task_evaluator.evaluate_qpos_batch(
+            env.data.qpos[None, :], time_s=env.data.time
+        )
+        np.testing.assert_allclose(
+            live.metrics["ball_tray_local_pos"],
+            fresh.metrics["ball_tray_local_pos"],
+        )
+        self.assertEqual(live.scalar_reward(), fresh.scalar_reward())
+
 
 class ChessTest(unittest.TestCase):
     def setUp(self):
@@ -444,6 +492,40 @@ class ContactPlacementTest(unittest.TestCase):
         self.assertTrue(result.metrics["object_table_contact"][0])
         self.assertTrue(result.metrics["object_gripper_contact"][0])
         self.assertFalse(result.scalar_success())
+
+    def test_env_does_not_latch_success_when_crossing_boundary_airborne(self):
+        env = make_test_env(self, self.model, "inhand transfer the item to other side")
+        env.model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+        env._task_evaluator.configure_from_randomization(
+            env.model,
+            SimpleNamespace(
+                metadata={"side": "left"},
+                object_states={"task_object_joint": {"pos": [0, 0.2, 0.01]}},
+            ),
+        )
+        position(env.model, env.data, "task_object_joint", [0, -0.099, 0.009])
+        mujoco.mj_forward(env.model, env.data)
+        initial = env.evaluate_task()
+        self.assertTrue(initial.metrics["object_table_contact"][0])
+        self.assertFalse(initial.scalar_success())
+        dof = int(env.model.joint("task_object_joint").dofadr[0])
+        env.data.qvel[dof : dof + 3] = [0, -1, 1]
+
+        _, _, _, _, info = env.step(np.empty(0), render_obs=False)
+
+        live = env.evaluate_task()
+        self.assertTrue(live.metrics["crossed_to_other_side"][0])
+        self.assertGreater(live.metrics["object_z"][0], 0.01)
+        self.assertFalse(live.metrics["object_table_contact"][0])
+        self.assertFalse(live.scalar_success())
+        self.assertFalse(live.metrics["ever_success"][0])
+        self.assertFalse(info["task_eval"]["ever_success"])
+        fresh = env._task_evaluator.evaluate_qpos_batch(env.data.qpos[None, :])
+        np.testing.assert_array_equal(live.success, fresh.success)
+        np.testing.assert_array_equal(
+            live.metrics["object_table_contact"],
+            fresh.metrics["object_table_contact"],
+        )
 
 
 class LegoToleranceTest(unittest.TestCase):

@@ -546,6 +546,8 @@ class MuJoCoYAMEnv(gym.Env):
             if self._task_runtime is not None:
                 self._task_runtime.before_step(self.model, self.data)
             mujoco.mj_step(self.model, self.data)
+            # Refresh geometry and contacts for the integrated qpos before task hooks.
+            mujoco.mj_fwdPosition(self.model, self.data)
             if getattr(self._task_evaluator, "requires_step_updates", False):
                 self._update_step_task_eval()
             if self._task_runtime is not None:

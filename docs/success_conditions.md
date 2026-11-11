@@ -13,8 +13,10 @@
   timestamp does not count as lowering. Completion is latched. Physics-step updates
   prevent an interruption between control observations from being missed.
   The environment owns the evaluator and shares its initial and physics-step
-  results with the runtime and step rewards. Evaluator resets and batch-width
-  changes clear temporal state while retaining the configured duration.
+  results with the runtime and step rewards. After each integration step it
+  refreshes position-dependent state so live scoring uses positions, site
+  transforms, and contacts from the same simulation state. Evaluator resets
+  and batch-width changes clear temporal state while retaining the configured duration.
   `evaluate_model_data` uses simulation time; qpos-only callers must supply
   `time_s` explicitly.
 - **Chess:** only the selected target squares must be occupied by upright pieces
