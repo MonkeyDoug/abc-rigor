@@ -104,7 +104,7 @@ class BallTrayBalancingRandomizer(SceneRandomizer):
         ball_quat = [1.0, 0.0, 0.0, 0.0]
         linear_velocity = np.zeros(3, dtype=np.float64)
         angular_velocity = np.zeros(3, dtype=np.float64)
-        balance_duration_s = sample_hold_duration_s(seed)
+        balance_duration_s = sample_hold_duration_s(rng)
         states = {
             _BALL_TRAY_TRAY_JOINT: {
                 "pos": tray_pos.tolist(),

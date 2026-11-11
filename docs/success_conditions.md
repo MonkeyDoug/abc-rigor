@@ -2,7 +2,8 @@
 
 - **Ball tray:** sample uniformly from `[5, 15.5)` seconds, then round down to
   the nearest half-second. The 21 requirements from 5 through 15 seconds are
-  equally likely. Record this duration and use it for both scoring and the
+  equally likely. Sample duration independently of the tray and ball scales.
+  Record this duration and use it for both scoring and the
   episode prompt: `balance the ball in the tray for at least X seconds`.
   Format whole seconds without `.0`. Keep the tray at least 5 cm
   above its initial height and the ball within the existing tray-local region
@@ -11,6 +12,9 @@
   at a later timestamp. Existing contact or repeated evaluation of the same
   timestamp does not count as lowering. Completion is latched. Physics-step updates
   prevent an interruption between control observations from being missed.
+  The environment owns the evaluator and shares its initial and physics-step
+  results with the runtime and step rewards. Evaluator resets and batch-width
+  changes clear temporal state while retaining the configured duration.
   `evaluate_model_data` uses simulation time; qpos-only callers must supply
   `time_s` explicitly.
 - **Chess:** only the selected target squares must be occupied by upright pieces

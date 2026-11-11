@@ -1,11 +1,16 @@
 """CPU regressions for the revised simulator success conditions."""
 
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import mujoco
 import numpy as np
 
+from abc_sim.config import RobotSystemConfig
+from abc_sim.env import MuJoCoYAMEnv
 from abc_sim.randomization.tasks.ball_tray import BallTrayBalancingRandomizer
 from abc_sim.task_eval.ball_tray import (
     BallTrayBalancingEvaluator,
@@ -86,6 +91,50 @@ class BallTrayTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "time_s"):
             self.evaluator.evaluate_qpos_batch(self.data.qpos[None, :])
 
+    def test_batch_resize_preserves_duration_and_hold_threshold(self):
+        rest = np.repeat(self.data.qpos[None, :], 2, axis=0)
+        raised = rest.copy()
+        for joint in ("ball_tray_joint", "ball_tray_ball_joint"):
+            address = int(self.model.jnt_qposadr[self.model.joint(joint).id])
+            raised[:, address + 2] += 0.1
+        for duration in (5.0, 15.0):
+            with self.subTest(duration=duration):
+                self.evaluator.reset()
+                self.evaluator.configure_from_randomization(
+                    self.model,
+                    SimpleNamespace(seed=12, metadata={"hold_duration_s": duration}),
+                )
+                initial = self.evaluator.evaluate_qpos_batch(rest, time_s=0)
+                np.testing.assert_array_equal(
+                    initial.metrics["hold_duration_s"], [duration, duration]
+                )
+                self.evaluator.evaluate_qpos_batch(raised, time_s=1)
+                before = self.evaluator.evaluate_qpos_batch(
+                    raised, time_s=1 + min(11.5, duration - 0.01)
+                )
+                self.assertFalse(before.metrics["hold_complete"].any())
+                reached = self.evaluator.evaluate_qpos_batch(
+                    raised, time_s=1 + duration
+                )
+                self.assertTrue(reached.metrics["hold_complete"].all())
+                self.assertFalse(reached.success.any())
+                lowered = self.evaluator.evaluate_qpos_batch(
+                    rest, time_s=2 + duration
+                )
+                self.assertTrue(lowered.success.all())
+
+    def test_reset_retains_duration_and_clears_hold_state(self):
+        self.sample(1, lifted=True)
+        self.sample(6, lifted=True)
+        self.assertTrue(self.sample(7).scalar_success())
+        self.evaluator.reset(nworld=3)
+        qpos = np.repeat(self.data.qpos[None, :], 3, axis=0)
+        result = self.evaluator.evaluate_qpos_batch(qpos, time_s=0)
+        np.testing.assert_array_equal(result.metrics["hold_duration_s"], [5, 5, 5])
+        self.assertFalse(result.metrics["hold_complete"].any())
+        self.assertFalse(result.success.any())
+        np.testing.assert_array_equal(result.metrics["continuous_hold_s"], [0, 0, 0])
+
     def test_existing_contact_is_not_a_lowering_event(self):
         address = int(self.model.jnt_qposadr[self.model.joint("ball_tray_joint").id])
         self.data.qpos[address + 3 : address + 7] = [
@@ -120,6 +169,26 @@ class BallTrayTest(unittest.TestCase):
         # endpoint buckets without requiring an exact random frequency.
         self.assertTrue(np.all((counts > 800) & (counts < 1200)), counts)
 
+    def test_randomized_duration_is_independent_of_object_scales(self):
+        randomizer = BallTrayBalancingRandomizer()
+        samples = []
+        for seed in range(512):
+            mujoco.mj_resetData(self.model, self.data)
+            state = randomizer.randomize(self.model, self.data, seed=seed)
+            samples.append(
+                (
+                    state.metadata["tray_scale"],
+                    state.metadata["ball_scale"],
+                    state.metadata["hold_duration_s"],
+                )
+            )
+        samples = np.asarray(samples)
+        np.testing.assert_array_equal(
+            np.unique(samples[:, 2]), np.arange(5.0, 15.5, 0.5)
+        )
+        correlations = np.corrcoef(samples, rowvar=False)[:2, 2]
+        self.assertTrue(np.all(np.abs(correlations) < 0.15), correlations)
+
     def test_randomized_prompt_matches_evaluator_and_runtime_duration(self):
         randomizer = BallTrayBalancingRandomizer()
         runtime = BallTrayBalancingRuntime()
@@ -138,6 +207,7 @@ class BallTrayTest(unittest.TestCase):
                 result = self.evaluator.evaluate_model_data(self.model, self.data)
                 self.assertEqual(result.metrics["hold_duration_s"][0], duration)
                 runtime.after_reset(self.model, self.data, randomization=state)
+                runtime.on_task_evaluation(result)
                 self.assertEqual(runtime.observation_prompt(), prompt)
                 self.assertEqual(runtime.debug_state()["display_prompt"], prompt)
                 runtime.after_step(self.model, self.data)
@@ -147,10 +217,11 @@ class BallTrayTest(unittest.TestCase):
         runtime = BallTrayBalancingRuntime()
         runtime.bind(self.model, self.data)
         runtime.after_reset(self.model, self.data, randomization=self.randomization)
+        runtime.on_task_evaluation(self.sample(0))
         prompt = "balance the ball in the tray for at least 5 seconds"
         self.assertEqual(runtime.observation_prompt(), prompt)
         for timestamp in (1, 6):
-            self.sample(timestamp, lifted=True)
+            runtime.on_task_evaluation(self.sample(timestamp, lifted=True))
             runtime.after_step(self.model, self.data)
             self.assertEqual(runtime.observation_prompt(), prompt)
         self.assertEqual(runtime.debug_state()["state"], "lowering")
@@ -158,10 +229,59 @@ class BallTrayTest(unittest.TestCase):
         self.assertEqual(
             runtime.debug_state()["display_prompt"], "Lower the tray onto the table"
         )
-        self.sample(7, ball_inside=False)
+        runtime.on_task_evaluation(self.sample(7, ball_inside=False))
         runtime.after_step(self.model, self.data)
         self.assertTrue(runtime.debug_state()["complete"])
         self.assertEqual(runtime.observation_prompt(), prompt)
+
+    def test_env_shares_one_evaluation_per_physics_step_and_after_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scene = Path(directory) / "tray.xml"
+            mujoco.mj_saveLastXML(str(scene), self.model)
+            env = MuJoCoYAMEnv(
+                config=RobotSystemConfig(),
+                render_cameras=False,
+                scene_xml=scene,
+                control_decimation=4,
+            )
+            self.addCleanup(env.close)
+            env.set_task("ball_tray_balancing")
+            env._task_randomizer = BallTrayBalancingRandomizer()
+            evaluate = BallTrayBalancingEvaluator.evaluate_model_data
+            # This scene has no robot joints; reset the task objects normally.
+            with (
+                mock.patch.object(env, "get_init_q", return_value=np.empty(0)),
+                mock.patch.object(
+                    BallTrayBalancingEvaluator,
+                    "evaluate_model_data",
+                    autospec=True,
+                    side_effect=evaluate,
+                ) as score,
+            ):
+                obs, info = env.reset(seed=4)
+                self.assertEqual(score.call_count, 1)
+                duration = info["randomization"].metadata["hold_duration_s"]
+                self.assertEqual(
+                    obs["prompt"],
+                    f"balance the ball in the tray for at least {duration:g} seconds",
+                )
+                self.assertEqual(env.task_runtime_debug_state()["duration_s"], duration)
+                _, reward, _, _, step_info = env.step(np.empty(0), render_obs=False)
+                self.assertEqual(score.call_count, 5)
+                self.assertIs(env._task_runtime._balance_result, env._step_task_eval)
+                self.assertEqual(reward, env._step_task_eval.scalar_reward())
+                self.assertEqual(
+                    step_info["task_success"], env._step_task_eval.scalar_success()
+                )
+                env.reset(seed=12)
+                self.assertEqual(score.call_count, 6)
+                self.assertFalse(env._step_task_eval.metrics["hold_complete"][0])
+                env.reload_from_model(env.model)
+                self.assertIsNone(env._step_task_eval)
+                self.assertIsNone(env._task_runtime._balance_result)
+                env.reset(seed=4)
+                self.assertEqual(score.call_count, 7)
+                self.assertIs(env._task_runtime._balance_result, env._step_task_eval)
 
 
 class ChessTest(unittest.TestCase):

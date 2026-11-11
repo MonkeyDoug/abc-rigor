@@ -12,8 +12,8 @@ from abc_sim.task_eval.contacts import has_contact, subtree_geom_ids
 from abc_sim.task_specs import SimTaskSpec
 
 
-def sample_hold_duration_s(seed: int | None) -> float:
-    """Uniformly sample the 21 half-second requirements from 5 through 15."""
+def sample_hold_duration_s(seed: int | np.random.Generator | None) -> float:
+    """Sample the 21 half-second requirements using a seed or existing RNG."""
     sampled = float(np.random.default_rng(seed).uniform(5.0, 15.5))
     return math.floor(sampled * 2.0) / 2.0
 
@@ -50,6 +50,7 @@ class BallTrayBalancingEvaluator:
         self._ball_radius_m = float(ball_radius_m)
         self._dropped_local_z_threshold_m = float(dropped_local_z_threshold_m)
         self._min_lift_m = float(min_lift_m)
+        self._configured_hold_duration_s = sample_hold_duration_s(0)
         self._bind_model(model)
         self.reset(nworld=1)
 
@@ -74,8 +75,9 @@ class BallTrayBalancingEvaluator:
         self._table_geom_ids = {int(table_geom)}
 
     def reset(self, *, nworld: int = 1) -> None:
+        """Clear temporal state while retaining the configured requirement."""
         self._nworld = int(nworld)
-        self._hold_duration_s = np.full(self._nworld, sample_hold_duration_s(0))
+        self._hold_duration_s = np.full(self._nworld, self._configured_hold_duration_s)
         self._hold_started_at = np.full(self._nworld, np.nan)
         self._last_time_s = np.full(self._nworld, np.nan)
         self._hold_complete = np.zeros(self._nworld, dtype=bool)
@@ -94,13 +96,17 @@ class BallTrayBalancingEvaluator:
             self._bind_model(model)
         seed = getattr(randomization, "seed", None)
         metadata = getattr(randomization, "metadata", None)
-        if not isinstance(metadata, dict):
-            self._hold_duration_s[:] = sample_hold_duration_s(seed)
-            return
-        duration = float(metadata.get("hold_duration_s", sample_hold_duration_s(seed)))
+        duration = (
+            float(metadata["hold_duration_s"])
+            if isinstance(metadata, dict) and "hold_duration_s" in metadata
+            else sample_hold_duration_s(seed)
+        )
         if not np.isfinite(duration) or not 5.0 <= duration <= 15.0:
             raise ValueError("hold_duration_s must be between 5 and 15 seconds")
+        self._configured_hold_duration_s = duration
         self._hold_duration_s[:] = duration
+        if not isinstance(metadata, dict):
+            return
         usable_half_extents = metadata.get("usable_half_extents_m")
         if usable_half_extents is not None:
             extents = np.asarray(usable_half_extents, dtype=np.float32)

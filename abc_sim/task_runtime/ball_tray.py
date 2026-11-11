@@ -8,8 +8,8 @@ from typing import Any
 import mujoco
 import numpy as np
 
-from abc_sim.task_eval.ball_tray import BallTrayBalancingEvaluator, format_hold_prompt
-from abc_sim.task_specs import get_task_spec
+from abc_sim.task_eval.ball_tray import format_hold_prompt
+from abc_sim.task_eval.base import TaskEvalResult
 
 _DEFAULT_DURATION_S = 12
 _HOLD_TO_START_S = 0.0
@@ -56,8 +56,7 @@ class BallTrayBalancingRuntime:
         self._applied_world_force_n = np.zeros(3, dtype=np.float64)
         self._perturbation_count = 0
         self._last_perturbation_force_n = 0.0
-        self._balance_evaluator: BallTrayBalancingEvaluator | None = None
-        self._balance_result = None
+        self._balance_result: TaskEvalResult | None = None
 
     def bind(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
         """Refresh cached model indices after a model swap."""
@@ -80,9 +79,7 @@ class BallTrayBalancingRuntime:
         tray_site_id = self._optional_site_id(model, _TRAY_CENTER_SITE)
         self._tray_center_site_id = tray_site_id if tray_site_id >= 0 else None
         self._applied_world_force_n[:] = 0.0
-        self._balance_evaluator = BallTrayBalancingEvaluator(
-            model=model, spec=get_task_spec("ball_tray_balancing")
-        )
+        self._balance_result = None
 
     def after_reset(
         self,
@@ -91,14 +88,10 @@ class BallTrayBalancingRuntime:
         *,
         randomization: Any = None,
     ) -> None:
-        """Reset countdown state and load the randomized balance duration."""
+        """Reset countdown and perturbations before receiving the initial score."""
 
-        assert self._balance_evaluator is not None
-        self._balance_evaluator.reset(nworld=1)
-        if randomization is not None:
-            self._balance_evaluator.configure_from_randomization(model, randomization)
-        self._balance_result = self._balance_evaluator.evaluate_model_data(model, data)
-        self._duration_s = float(self._balance_result.metrics["hold_duration_s"][0])
+        self._balance_result = None
+        self._duration_s = _DEFAULT_DURATION_S
         self._started_at_s = None
         self._deadline_s = None
         self._grip_detected_at_s = None
@@ -127,6 +120,12 @@ class BallTrayBalancingRuntime:
         self._perturbation_count = 0
         self._last_perturbation_force_n = 0.0
 
+    def on_task_evaluation(self, result: TaskEvalResult) -> None:
+        """Consume the environment's authoritative hold-and-lower score."""
+        self._balance_result = result
+        self._duration_s = float(result.metrics["hold_duration_s"][0])
+        self._update_display()
+
     def observation_prompt(self) -> str:
         """Use the episode's required duration throughout the policy rollout."""
         return format_hold_prompt(self._duration_s)
@@ -137,11 +136,10 @@ class BallTrayBalancingRuntime:
         self._apply_active_perturbation_force(data)
 
     def after_step(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
-        """Update the countdown after MuJoCo has produced contact data."""
+        """Update perturbations after receiving this physics step's task score."""
 
         now_s = float(data.time)
-        assert self._balance_evaluator is not None
-        self._balance_result = self._balance_evaluator.evaluate_model_data(model, data)
+        assert self._balance_result is not None
         self._contacted_handles = self._detect_gripper_handle_contacts(model, data)
         both_posts_gripped = self._both_posts_gripped(self._contacted_handles)
         if both_posts_gripped:
@@ -164,7 +162,6 @@ class BallTrayBalancingRuntime:
             and now_s - self._last_both_handles_contact_at_s <= _HANDLE_CONTACT_GRACE_S
         )
         self._maybe_schedule_perturbation(now_s, handles_held)
-        self._update_display(now_s, both_posts_gripped)
 
     def debug_state(self) -> dict[str, Any]:
         """Return countdown and contact state for the VR streamer/debug UI."""
@@ -346,7 +343,7 @@ class BallTrayBalancingRuntime:
             for right_handle in right_handles
         )
 
-    def _update_display(self, now_s: float, both_posts_gripped: bool) -> None:
+    def _update_display(self) -> None:
         if self._balance_result is None:
             return
         metrics = self._balance_result.metrics
