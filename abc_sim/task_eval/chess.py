@@ -14,7 +14,8 @@ from abc_sim.task_eval.bottles import _quat_to_rotmat_batch
 from abc_sim.task_specs import SimTaskSpec
 
 
-def _matched_pieces(ok: np.ndarray, distances: np.ndarray) -> np.ndarray:
+def _matched_rows(ok: np.ndarray, distances: np.ndarray) -> np.ndarray:
+    """Match rows in order without displacing previously matched rows."""
     owners = np.full(ok.shape[1], -1, dtype=np.int32)
 
     def assign(piece: int, visited: set[int]) -> bool:
@@ -34,13 +35,12 @@ def _matched_pieces(ok: np.ndarray, distances: np.ndarray) -> np.ndarray:
 
 
 class ChessBoardSetupEvaluator:
-    """Require the complete board setup, allowing same-color/type exchanges.
+    """Require the selected home squares, allowing same-color/type exchanges.
 
-    All model pieces must stand upright on distinct matching home squares,
+    Upright pieces of the matching color/type can fill the selected squares,
     including pieces outside the randomizer's displaced target subset.
-    Goals follow the board's current pose. A maximum-cardinality matching
-    within each color/type class avoids rejecting a valid exchange because
-    a nearest-first assignment consumed another piece's only valid square.
+    Goals follow the board's current pose. Match selected squares first,
+    then score the remaining squares only for full-board diagnostics.
     """
 
     def __init__(
@@ -83,6 +83,7 @@ class ChessBoardSetupEvaluator:
         if model is not self.model:
             self._bind_model(model)
             self.reset(nworld=self._nworld)
+        self._directive = None
 
         metadata = getattr(randomization, "metadata", None)
         if metadata is None and isinstance(randomization, Mapping):
@@ -92,8 +93,10 @@ class ChessBoardSetupEvaluator:
         target_joints = metadata.get("target_joints") or []
         target_poses = metadata.get("target_poses") or {}
         board_poses = metadata.get("board_target_poses") or {}
-        if not isinstance(target_poses, Mapping) or not isinstance(
-            board_poses, Mapping
+        if (
+            not target_joints
+            or not isinstance(target_poses, Mapping)
+            or not isinstance(board_poses, Mapping)
         ):
             return
 
@@ -129,6 +132,9 @@ class ChessBoardSetupEvaluator:
         )
         if not all_joints:
             raise ValueError("No chess piece joints found")
+        unknown_targets = set(target_joints) - set(all_joints)
+        if unknown_targets:
+            raise ValueError(f"Unknown chess target joints: {sorted(unknown_targets)}")
         for joint_name in all_joints:
             pose = board_poses.get(joint_name) or target_poses.get(joint_name)
             if pose is None and joint_name not in target_joints:
@@ -141,13 +147,15 @@ class ChessBoardSetupEvaluator:
             goals_board.append(rot_world_from_board.T @ (world - board_pos))
 
         classes = [re.sub(r"_\d+_jnt$", "", name) for name in joints]
+        target_indices = [i for i, name in enumerate(joints) if name in target_joints]
         self._directive = {
             "joints": joints,
             "classes": classes,
             "normal_local": normal_local,
             "addrs": np.asarray(addrs, dtype=np.int32),
             "goals_board": np.asarray(goals_board, dtype=np.float64),
-            "selected_target_count": len(target_joints),
+            "target_indices": target_indices,
+            "selected_target_count": len(target_indices),
             "non_target_indices": [
                 i for i, name in enumerate(joints) if name not in target_joints
             ],
@@ -183,13 +191,10 @@ class ChessBoardSetupEvaluator:
         rot_board_from_world: np.ndarray,
         board_pos: np.ndarray,
         normal_local: np.ndarray,
-        classes: list[str] | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Per piece: (on-a-matched-square mask, upright mask).
-
-        With ``classes`` given, find a maximum matching over valid placements
-        within each class.
-        """
+        classes: list[str],
+        priority_goals: list[int],
+    ) -> np.ndarray:
+        """Return occupied goal squares, maximizing selected-square coverage."""
 
         pos = np.stack([qpos_batch[:, adr : adr + 3] for adr in addrs], axis=1).astype(
             np.float64
@@ -201,34 +206,32 @@ class ChessBoardSetupEvaluator:
             "bij,bnj->bni", rot_board_from_world, pos - board_pos[:, None, :]
         )
         batch, count = rel.shape[:2]
-
-        in_square = np.zeros((batch, count), dtype=bool)
-        if classes is None:
-            planar, height = self._split_plane_normal(
-                rel - goals_board[None, :, :], normal_local
-            )
-            in_square = (planar <= self.position_tolerance_m) & (
-                np.abs(height) <= self.height_tolerance_m
-            )
-        else:
-            class_indices: dict[str, list[int]] = {}
-            for index, name in enumerate(classes):
-                class_indices.setdefault(name, []).append(index)
-            for indices in class_indices.values():
-                idx = np.asarray(indices, dtype=np.int32)
-                for b in range(batch):
-                    # planar distance of every class piece to every class goal
-                    delta = rel[b, idx][:, None, :] - goals_board[idx][None, :, :]
-                    planar, height = self._split_plane_normal(delta, normal_local)
-                    ok = (planar <= self.position_tolerance_m) & (
-                        np.abs(height) <= self.height_tolerance_m
-                    )
-                    for piece in _matched_pieces(ok, planar):
-                        in_square[b, idx[piece]] = True
-
         rot = _quat_to_rotmat_batch(quat.reshape(-1, 4).astype(np.float32))
         upright = rot[:, 2, 2].reshape(batch, count) >= self.upright_z_min
-        return in_square, upright
+
+        placed = np.zeros((batch, count), dtype=bool)
+        selected = set(priority_goals)
+        class_indices: dict[str, list[int]] = {}
+        for index, name in enumerate(classes):
+            class_indices.setdefault(name, []).append(index)
+        for indices in class_indices.values():
+            idx = np.asarray(indices, dtype=np.int32)
+            goal_idx = np.asarray(
+                sorted(indices, key=lambda i: i not in selected), dtype=np.int32
+            )
+            for b in range(batch):
+                delta = rel[b, idx][:, None, :] - goals_board[goal_idx][None, :, :]
+                planar, height = self._split_plane_normal(delta, normal_local)
+                ok = (
+                    (planar <= self.position_tolerance_m)
+                    & (np.abs(height) <= self.height_tolerance_m)
+                    & upright[b, idx, None]
+                )
+                # Match goal rows to piece columns. Processing selected goals
+                # first prevents diagnostic goals from consuming their pieces.
+                for goal in _matched_rows(ok.T, planar.T):
+                    placed[b, goal_idx[goal]] = True
+        return placed
 
     def evaluate_qpos_batch(self, qpos_batch: np.ndarray) -> TaskEvalResult:
         qpos_batch = np.asarray(qpos_batch, dtype=np.float32)
@@ -260,7 +263,7 @@ class ChessBoardSetupEvaluator:
             _quat_to_rotmat_batch(board_quat), 1, 2
         ).astype(np.float64)
 
-        in_square, upright = self._piece_placement(
+        placed = self._piece_placement(
             qpos_batch,
             directive["addrs"],
             directive["goals_board"],
@@ -268,11 +271,13 @@ class ChessBoardSetupEvaluator:
             board_pos,
             directive["normal_local"],
             classes=directive["classes"],
+            priority_goals=directive["target_indices"],
         )
-        placed = in_square & upright
         num_placed = placed.sum(axis=1).astype(np.int32)
-        target_count = len(directive["joints"])
-        success = num_placed == target_count
+        targets_placed = placed[:, directive["target_indices"]]
+        num_targets_placed = targets_placed.sum(axis=1).astype(np.int32)
+        target_count = directive["selected_target_count"]
+        success = num_targets_placed == target_count
         self._ever_success |= success
 
         num_non_target_disturbed = (
@@ -280,20 +285,24 @@ class ChessBoardSetupEvaluator:
         )
 
         placed_names = [
-            [name for name, ok in zip(directive["joints"], world) if bool(ok)]
+            [
+                directive["joints"][i]
+                for i in directive["target_indices"]
+                if bool(world[i])
+            ]
             for world in placed
         ]
         return TaskEvalResult(
-            reward=(num_placed.astype(np.float32) / float(max(target_count, 1))),
+            reward=(num_targets_placed.astype(np.float32) / float(target_count)),
             success=success,
             metrics={
                 "goal_configured": True,
                 "scenario": directive["scenario"],
                 "target_count": target_count,
-                "piece_count": target_count,
+                "piece_count": len(directive["joints"]),
                 "selected_target_count": directive["selected_target_count"],
                 "num_pieces_placed": num_placed,
-                "num_targets_placed": num_placed,
+                "num_targets_placed": num_targets_placed,
                 "targets_placed": placed_names,
                 "num_non_target_disturbed": num_non_target_disturbed,
                 "ever_success": self._ever_success.copy(),

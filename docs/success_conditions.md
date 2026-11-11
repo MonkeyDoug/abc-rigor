@@ -13,10 +13,12 @@
   prevent an interruption between control observations from being missed.
   `evaluate_model_data` uses simulation time; qpos-only callers must supply
   `time_s` explicitly.
-- **Chess:** all pieces must be upright on their home squares, including pieces
-  outside the displaced target subset. Pieces of the same color and type are
-  interchangeable across that entire set. Match valid placements one-to-one;
-  retain the existing board-relative position, height, and upright tolerances.
+- **Chess:** only the selected target squares must be occupied by upright pieces
+  of the matching color and type. Pieces are interchangeable across the entire
+  same-color/type set. Match selected squares first, one-to-one; unselected
+  squares contribute only to full-board diagnostics. Reward is the fraction
+  of selected targets filled. Retain the existing board-relative position,
+  height, and upright tolerances.
   In both chess scenes, swap the pieces' dark and light materials while
   preserving their names, positions, meshes, and evaluator identities.
 - **Relative placement:** allow zero separation along the requested direction.

@@ -184,14 +184,17 @@ class ChessTest(unittest.TestCase):
         self.evaluator = ChessBoardSetupEvaluator(
             model=self.model, spec=get_task_spec("set up chess pieces on the board")
         )
+        self.configure_targets("white_pawn_1_jnt")
+
+    def configure_targets(self, *joints):
         self.evaluator.configure_from_randomization(
             self.model,
             SimpleNamespace(
                 object_states={"chessboard": {"pos": [0, 0, 0], "quat": [1, 0, 0, 0]}},
                 metadata={
-                    "target_joints": ["white_pawn_1_jnt"],
+                    "target_joints": list(joints),
                     "target_poses": {
-                        "white_pawn_1_jnt": {"pos": self.goals["white_pawn_1_jnt"]}
+                        name: {"pos": self.goals[name]} for name in joints
                     },
                     "board_target_poses": {
                         name: {"pos": xyz} for name, xyz in self.goals.items()
@@ -213,11 +216,64 @@ class ChessTest(unittest.TestCase):
         self.assertTrue(self.result().scalar_success())
         self.assertEqual(self.result().metrics["piece_count"], 3)
 
-    def test_nontarget_piece_must_also_be_placed(self):
+    def test_nontarget_disturbance_does_not_block_success_or_reduce_reward(self):
         position(self.model, self.data, "white_pawn_2_jnt", [0.5, 0, 0.03])
-        self.assertFalse(self.result().scalar_success())
+        result = self.result()
+        self.assertTrue(result.scalar_success())
+        self.assertEqual(result.reward[0], 1.0)
+        self.assertEqual(result.metrics["target_count"], 1)
+        self.assertEqual(result.metrics["num_targets_placed"][0], 1)
+        self.assertEqual(result.metrics["num_pieces_placed"][0], 2)
+        self.assertEqual(result.metrics["num_non_target_disturbed"][0], 1)
+
+    def test_selected_square_must_be_filled(self):
+        position(self.model, self.data, "white_pawn_1_jnt", [0.5, 0, 0.03])
+        result = self.result()
+        self.assertFalse(result.scalar_success())
+        self.assertEqual(result.reward[0], 0.0)
+        self.assertEqual(result.metrics["num_non_target_disturbed"][0], 0)
+
+    def test_selected_square_takes_priority_over_nonselected_square(self):
+        position(self.model, self.data, "white_pawn_1_jnt", [0.5, 0, 0.03])
+        # This equivalent pawn is closer to the unselected square, but it can
+        # fill the selected square. The unselected square must not consume it.
+        position(self.model, self.data, "white_pawn_2_jnt", [0.026, 0, 0.03])
+        result = self.result()
+        self.assertTrue(result.scalar_success())
+        self.assertEqual(result.metrics["targets_placed"], [["white_pawn_1_jnt"]])
+        self.assertEqual(result.metrics["num_non_target_disturbed"][0], 1)
+
+    def test_upright_equivalent_piece_can_fill_target_beside_toppled_piece(self):
+        address = int(self.model.jnt_qposadr[self.model.joint("white_pawn_1_jnt").id])
+        self.data.qpos[address + 3 : address + 7] = [0, 1, 0, 0]
+        position(self.model, self.data, "white_pawn_2_jnt", [0.026, 0, 0.03])
+        self.assertTrue(self.result().scalar_success())
+
+    def test_reward_counts_only_selected_targets(self):
+        self.configure_targets("white_pawn_1_jnt", "white_pawn_2_jnt")
+        position(self.model, self.data, "white_pawn_2_jnt", [0.5, 0, 0.03])
+        result = self.result()
+        self.assertFalse(result.scalar_success())
+        self.assertEqual(result.reward[0], 0.5)
+        self.assertEqual(result.metrics["num_targets_placed"][0], 1)
+        self.assertEqual(result.metrics["num_pieces_placed"][0], 2)
+
+    def test_empty_target_subset_is_unconfigured(self):
+        self.configure_targets()
+        result = self.result()
+        self.assertFalse(result.scalar_success())
+        self.assertFalse(result.metrics["goal_configured"])
+
+    def test_selected_subset_is_scored_independently_for_each_world(self):
+        qpos = np.repeat(self.data.qpos[None, :], 2, axis=0)
+        address = int(self.model.jnt_qposadr[self.model.joint("white_pawn_1_jnt").id])
+        qpos[1, address] = 0.5
+        result = self.evaluator.evaluate_qpos_batch(qpos)
+        np.testing.assert_array_equal(result.success, [True, False])
+        np.testing.assert_array_equal(result.reward, [1.0, 0.0])
 
     def test_matching_finds_feasible_assignment(self):
+        self.configure_targets("white_pawn_1_jnt", "white_pawn_2_jnt")
         position(self.model, self.data, "white_pawn_1_jnt", [0.024, 0, 0.03])
         position(self.model, self.data, "white_pawn_2_jnt", [-0.025, 0, 0.03])
         self.assertTrue(self.result().scalar_success())
