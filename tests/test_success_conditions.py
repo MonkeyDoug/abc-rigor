@@ -613,7 +613,53 @@ class LegoToleranceTest(unittest.TestCase):
 
 
 class RelativePlacementTest(unittest.TestCase):
-    def test_nonnegative_along_with_existing_upper_and_perpendicular_limits(self):
+    def setUp(self):
+        # A 4 x 2 cm reference box (half extents), asked direction +x.
+        self.model = mujoco.MjModel.from_xml_string(
+            "<mujoco><worldbody>"
+            + body("mover", "mover_joint", "0 0 .02")
+            + '<body name="reference" pos="0 0 .02"><freejoint name="reference_joint"/>'
+            '<geom type="box" size=".04 .02 .02" mass=".1"/></body>'
+            + "</worldbody></mujoco>"
+        )
+        self.data = mujoco.MjData(self.model)
+        self.evaluator = PutRelativeEvaluator(model=self.model, spec=get_task_spec("put_relative"))
+        self.evaluator.configure_from_randomization(
+            self.model,
+            SimpleNamespace(
+                metadata={"mover_object": "mover", "reference_object": "reference", "direction_offset_xy": [1, 0]},
+                object_states={"mover_joint": {"pos": [0, 0, 0.02]}},
+            ),
+        )
+
+    def score(self, x, y):
+        position(self.model, self.data, "mover_joint", [x, y, 0.02])
+        result = self.evaluator.evaluate_qpos_batch(self.data.qpos[None, :])
+        return result.scalar_success(), float(result.reward[0])
+
+    def test_nothing_counts_short_of_the_reference_edge(self):
+        for x, y in ((0.039, 0), (0.0, 0.07), (-0.02, 0), (-0.10, 0.03)):
+            with self.subTest(x=x, y=y):
+                self.assertEqual(self.score(x, y), (False, 0.0))
+
+    def test_past_the_edge_within_the_cone_succeeds(self):
+        for x, y in ((0.041, 0), (0.10, 0.08), (0.30, 0)):
+            with self.subTest(x=x, y=y):
+                self.assertEqual(self.score(x, y), (True, 1.0))
+        self.assertFalse(self.score(0.05, 0.06)[0])  # more sideways than out: outside the cone
+
+    def test_partial_reward_past_the_edge_is_capped_and_linear(self):
+        success, reward = self.score(0.10, 0.12)  # 4 cm too far sideways
+        self.assertFalse(success)
+        self.assertAlmostEqual(reward, 0.5 * (1 - 0.04 / 0.15), places=5)
+        self.assertEqual(self.score(0.10, 0.30)[1], 0.0)
+
+    def test_edge_follows_the_reference_rotation(self):
+        address = int(self.model.jnt_qposadr[self.model.joint("reference_joint").id])
+        self.data.qpos[address + 3 : address + 7] = [np.cos(np.pi / 4), 0, 0, np.sin(np.pi / 4)]  # 90 deg yaw
+        self.assertEqual(self.score(0.03, 0), (True, 1.0))  # now only 2 cm deep along +x
+
+    def test_lenient_nonnegative_along_with_existing_upper_and_perpendicular_limits(self):
         model = mujoco.MjModel.from_xml_string(
             "<mujoco><worldbody>"
             + body("mover", "mover_joint", "0 0 .02")
@@ -622,7 +668,7 @@ class RelativePlacementTest(unittest.TestCase):
         )
         data = mujoco.MjData(model)
         evaluator = PutRelativeEvaluator(
-            model=model, spec=get_task_spec("put_relative")
+            model=model, spec=get_task_spec("put_relative"), require_past_reference_edge=False
         )
         evaluator.configure_from_randomization(
             model,
