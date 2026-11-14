@@ -104,6 +104,12 @@ class BallTrayWindowTest(unittest.TestCase):
         done = self.sample(13.6, REST_Z, held=False)
         self.assertEqual(self.score(done), (True, 1.0))
 
+    def test_a_placement_within_one_control_step_still_checks_the_handles(self):
+        self.hold(1, 12)
+        touchdown = self.sample(12.034, REST_Z)  # lifted at the previous sample
+        self.assertTrue(touchdown.metrics["handles_held"][0])
+        self.assertTrue(touchdown.metrics["settling"][0])
+
     def test_placing_before_10_s_keeps_the_credit_reached_without_success(self):
         self.hold(1, 8)
         early = self.place(8.6)  # 7.5 s up

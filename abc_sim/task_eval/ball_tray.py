@@ -305,7 +305,7 @@ class BallTrayBalancingEvaluator:
             "tray_table_contact": np.asarray(
                 has_contact(data, self._tray_geom_ids, self._table_geom_ids), dtype=bool
             ),
-            # Only touchdown uses the handles: scan only while a held tray is below the lift height.
+            # Only touchdown uses the handles: scan only while a hold is running.
             "both_handles_gripped": np.asarray(
                 self._needs_handles
                 and len(self._handle_geom_ids) == 2
@@ -506,7 +506,8 @@ class BallTrayBalancingEvaluator:
         self._late_placement |= outside & (self._touch_air_s >= low)
         self._final_reward[outside] = self._touch_value[outside]
         phase[settled] = _DONE
-        self._needs_handles = bool(np.any((phase == _HOLDING) & ~lifted))
+        # Scored once per control step, a fast placement can go from lifted to touchdown in one sample.
+        self._needs_handles = bool(np.any(phase == _HOLDING))
 
         # A lost ball leaves the final reward at 0; success sets it to 1.
         reward = np.where(
