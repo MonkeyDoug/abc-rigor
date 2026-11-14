@@ -22,6 +22,26 @@ def format_hold_prompt(duration_s: float) -> str:
     return f"balance the ball in the tray for at least {duration_s:g} seconds"
 
 
+HOLD_WINDOW_S = (10.0, 15.0)
+TRAY_HANDLE_GEOMS = (
+    "ball_tray_left_handle_collision",
+    "ball_tray_right_handle_collision",
+)
+_HANDLE_GRACE_S = 0.1
+_MAX_LOWERING_S = 2.0  # from below the lift height to touchdown
+_HELD_REWARD = 0.9
+_OVER_HOLD_FLOOR = 0.5
+_IDLE, _HOLDING, _SETTLING, _DONE = 0, 1, 2, 3
+
+
+def format_window_prompt(window_s: tuple[float, float]) -> str:
+    low, high = window_s
+    return (
+        f"keep the ball balanced on the tray for {low:g} to {high:g} seconds, "
+        "then gently place the tray on the table"
+    )
+
+
 class BallTrayBalancingEvaluator:
     """Hold the lifted tray continuously, then return it to table contact.
 
@@ -32,6 +52,19 @@ class BallTrayBalancingEvaluator:
     a hold with a gripper touching the ball does not count
     (``forbid_gripper_ball_contact``). With both off, the ball no longer affects
     success once the sampled duration is met.
+
+    By default the hold has a window (``hold_window_s``, 10-15 s): keep the
+    tray up with the ball on it for 10-15 s, then place it gently. Air time runs
+    from the start of the hold until the tray is back below the lift height, and
+    touchdown must follow within 2 s. A gentle placement touches down with both
+    handles gripped (``require_handles_at_touchdown``), and the ball then stays
+    on the tray, untouched, for ``settle_s``. While up, the reward is 0.9 x air
+    time / 10 s, 0.9 through 15 s, then falls to 0.5 over ``over_hold_decay_s``.
+    Placing ends the attempt: inside the window it succeeds (1.0); outside it,
+    the reward reached at touchdown is kept, without success. A placement
+    without both handles keeps at most 0.5. Touching or losing the ball before
+    10 s restarts the hold; after 10 s, or while settling, it scores 0.
+    ``hold_window_s=None`` restores the sampled "at least X seconds" hold.
     """
 
     requires_step_updates = True
@@ -49,6 +82,10 @@ class BallTrayBalancingEvaluator:
         min_lift_m: float = 0.05,
         require_ball_on_tray_when_lowered: bool = True,
         forbid_gripper_ball_contact: bool = True,
+        hold_window_s: tuple[float, float] | None = HOLD_WINDOW_S,
+        require_handles_at_touchdown: bool = True,
+        settle_s: float = 1.0,
+        over_hold_decay_s: float = 5.0,
     ) -> None:
         self.spec = spec
         self._ball_joint_name = ball_joint_name
@@ -59,7 +96,22 @@ class BallTrayBalancingEvaluator:
         self._min_lift_m = float(min_lift_m)
         self.require_ball_on_tray_when_lowered = bool(require_ball_on_tray_when_lowered)
         self.forbid_gripper_ball_contact = bool(forbid_gripper_ball_contact)
-        self._configured_hold_duration_s = sample_hold_duration_s(0)
+        self.hold_window_s = (
+            None if hold_window_s is None else tuple(map(float, hold_window_s))
+        )
+        if (
+            self.hold_window_s is not None
+            and not 0.0 < self.hold_window_s[0] <= self.hold_window_s[1]
+        ):
+            raise ValueError("hold_window_s must be (low, high) with 0 < low <= high")
+        self.require_handles_at_touchdown = bool(require_handles_at_touchdown)
+        self.settle_s = float(settle_s)
+        self.over_hold_decay_s = float(over_hold_decay_s)
+        self._configured_hold_duration_s = (
+            self.hold_window_s[0]
+            if self.hold_window_s is not None
+            else sample_hold_duration_s(0)
+        )
         self._bind_model(model)
         self.reset(nworld=1)
 
@@ -82,9 +134,20 @@ class BallTrayBalancingEvaluator:
         if table_geom < 0:
             raise ValueError("Table geom 'table_plane' not found")
         self._table_geom_ids = {int(table_geom)}
-        ball_body = int(model.jnt_bodyid[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, self._ball_joint_name)])
+        ball_body = int(
+            model.jnt_bodyid[
+                mujoco.mj_name2id(
+                    model, mujoco.mjtObj.mjOBJ_JOINT, self._ball_joint_name
+                )
+            ]
+        )
         self._ball_geom_ids = subtree_geom_ids(model, ball_body)
         self._gripper_geom_ids = gripper_geom_ids(model)
+        self._handle_geom_ids = [
+            {geom}
+            for name in TRAY_HANDLE_GEOMS
+            if (geom := mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)) >= 0
+        ]
 
     def reset(self, *, nworld: int = 1) -> None:
         """Clear temporal state while retaining the configured requirement."""
@@ -99,6 +162,18 @@ class BallTrayBalancingEvaluator:
         self._completed = np.zeros(self._nworld, dtype=bool)
         self._ball_lost = np.zeros(self._nworld, dtype=bool)
         self._rest_tray_z: np.ndarray | None = None
+        self._phase = np.full(self._nworld, _IDLE, dtype=np.int8)
+        self._air_ended_at = np.full(self._nworld, np.nan)
+        self._handles_seen_at = np.full(self._nworld, np.nan)
+        self._settle_until = np.full(self._nworld, np.nan)
+        self._touch_value = np.zeros(self._nworld, dtype=np.float64)
+        self._touch_in_window = np.zeros(self._nworld, dtype=bool)
+        self._touch_air_s = np.zeros(self._nworld, dtype=np.float64)
+        self._final_reward = np.zeros(self._nworld, dtype=np.float64)
+        self._early_placement = np.zeros(self._nworld, dtype=bool)
+        self._late_placement = np.zeros(self._nworld, dtype=bool)
+        self._rough_placement = np.zeros(self._nworld, dtype=bool)
+        self._needs_handles = False
 
     def configure_from_randomization(
         self,
@@ -116,6 +191,8 @@ class BallTrayBalancingEvaluator:
         )
         if not np.isfinite(duration) or not 5.0 <= duration <= 15.0:
             raise ValueError("hold_duration_s must be between 5 and 15 seconds")
+        if self.hold_window_s is not None:
+            duration = self.hold_window_s[0]
         self._configured_hold_duration_s = duration
         self._hold_duration_s[:] = duration
         if not isinstance(metadata, dict):
@@ -221,10 +298,21 @@ class BallTrayBalancingEvaluator:
             "ball_dropped": ball_dropped,
             "time_s": np.asarray(data.time, dtype=np.float64),
             "ball_gripper_contact": np.asarray(
-                has_contact(data, self._ball_geom_ids, self._gripper_geom_ids), dtype=bool
+                has_contact(data, self._ball_geom_ids, self._gripper_geom_ids),
+                dtype=bool,
             ),
             "tray_table_contact": np.asarray(
                 has_contact(data, self._tray_geom_ids, self._table_geom_ids), dtype=bool
+            ),
+            # Only touchdown uses the handles: scan only while a held tray is below the lift height.
+            "both_handles_gripped": np.asarray(
+                self._needs_handles
+                and len(self._handle_geom_ids) == 2
+                and all(
+                    has_contact(data, handle, self._gripper_geom_ids)
+                    for handle in self._handle_geom_ids
+                ),
+                dtype=bool,
             ),
         }
 
@@ -256,6 +344,10 @@ class BallTrayBalancingEvaluator:
                 "Simulation time moved backwards without an evaluator reset"
             )
         self._last_time_s = now.copy()
+        if self.hold_window_s is not None:
+            return self._window_result(
+                metrics, current_balanced, lifted, tray_lift, now
+            )
         ready_to_lower = self._hold_complete.copy()
         valid_hold = current_balanced & lifted
         if self.forbid_gripper_ball_contact:
@@ -276,14 +368,19 @@ class BallTrayBalancingEvaluator:
         table_contact = np.asarray(metrics["tray_table_contact"], dtype=bool)
         new_contact = table_contact & ~self._last_table_contact
         self._completed |= (
-            ready_to_lower & (now > self._hold_completed_at) & new_contact & ~self._ball_lost
+            ready_to_lower
+            & (now > self._hold_completed_at)
+            & new_contact
+            & ~self._ball_lost
         )
         self._last_table_contact = table_contact.copy()
         progress = np.clip(elapsed / self._hold_duration_s, 0.0, 1.0)
         reward = np.where(
             self._completed,
             1.0,
-            np.where(self._ball_lost, 0.0, np.where(self._hold_complete, 0.9, 0.9 * progress)),
+            np.where(
+                self._ball_lost, 0.0, np.where(self._hold_complete, 0.9, 0.9 * progress)
+            ),
         )
 
         return TaskEvalResult(
@@ -296,17 +393,151 @@ class BallTrayBalancingEvaluator:
                 "lifted": lifted.copy(),
                 "continuous_hold_s": elapsed.copy(),
                 "hold_duration_s": self._hold_duration_s.copy(),
+                "hold_window_s": np.full((self._nworld, 2), np.nan),
                 "hold_complete": self._hold_complete.copy(),
                 "ball_lost_after_hold": self._ball_lost.copy(),
                 "ever_success": self._completed.copy(),
-                "usable_half_extents_m": np.broadcast_to(
-                    self._usable_half_extents,
-                    (self._nworld, 2),
+                **self._shape_metrics(),
+            },
+        )
+
+    def _shape_metrics(self) -> dict[str, np.ndarray]:
+        return {
+            "usable_half_extents_m": np.broadcast_to(
+                self._usable_half_extents,
+                (self._nworld, 2),
+            ).copy(),
+            "ball_radius_m": np.full(
+                (self._nworld,),
+                self._ball_radius_m,
+                dtype=np.float32,
+            ),
+        }
+
+    def _window_result(
+        self,
+        metrics: dict[str, np.ndarray],
+        current_balanced: np.ndarray,
+        lifted: np.ndarray,
+        tray_lift: np.ndarray,
+        now: np.ndarray,
+    ) -> TaskEvalResult:
+        """Score a hold that ends with a gentle placement, best inside the window."""
+        low, high = self.hold_window_s
+        ball_ok = current_balanced.copy()
+        if self.forbid_gripper_ball_contact:
+            ball_ok &= ~np.asarray(metrics["ball_gripper_contact"], dtype=bool)
+        phase = self._phase
+
+        start = (phase == _IDLE) & ball_ok & lifted
+        self._hold_started_at[start] = now[start]
+        self._air_ended_at[start] = np.nan
+        phase[start] = _HOLDING
+        holding = phase == _HOLDING
+        # Air time stops while the tray is below the lift height and resumes if it goes back up.
+        self._air_ended_at[holding & lifted] = np.nan
+        dipped = holding & ~lifted & np.isnan(self._air_ended_at)
+        self._air_ended_at[dipped] = now[dipped]
+        since_start = np.where(holding, now - self._hold_started_at, 0.0)
+        air_s = np.where(
+            holding,
+            np.where(np.isnan(self._air_ended_at), now, self._air_ended_at)
+            - self._hold_started_at,
+            0.0,
+        )
+        self._hold_complete = holding & (air_s >= low)
+
+        # The ball: before 10 s a problem restarts the hold, after it ends the attempt at 0.
+        bad = holding & ~ball_ok
+        restart = bad & ~self._hold_complete
+        lost = bad & self._hold_complete & self.require_ball_on_tray_when_lowered
+        phase[restart] = _IDLE
+        self._ball_lost |= lost
+        phase[lost] = _DONE
+        holding = phase == _HOLDING
+
+        over = np.minimum(
+            np.maximum(since_start - high, 0.0) / max(self.over_hold_decay_s, 1e-9), 1.0
+        )
+        hold_value = np.where(
+            air_s < low,
+            _HELD_REWARD * air_s / low,
+            _HELD_REWARD - (_HELD_REWARD - _OVER_HOLD_FLOOR) * over,
+        )
+
+        gripped = np.asarray(metrics["both_handles_gripped"], dtype=bool)
+        self._handles_seen_at[gripped] = now[gripped]
+        handles_held = now - self._handles_seen_at <= _HANDLE_GRACE_S
+        touchdown = (
+            holding & ~lifted & np.asarray(metrics["tray_table_contact"], dtype=bool)
+        )
+        gentle = (
+            handles_held
+            if self.require_handles_at_touchdown
+            else np.ones_like(touchdown)
+        )
+        # Hovering just above the table is still holding: touchdown must follow the air time promptly.
+        in_window = (
+            (air_s >= low) & (air_s <= high) & (since_start - air_s <= _MAX_LOWERING_S)
+        )
+        settle = touchdown & gentle
+        phase[settle] = _SETTLING
+        self._settle_until[settle] = now[settle] + self.settle_s
+        self._touch_value[settle] = hold_value[settle]
+        self._touch_in_window[settle] = in_window[settle]
+        self._touch_air_s[settle] = air_s[settle]
+        rough = touchdown & ~gentle
+        self._rough_placement |= rough
+        self._final_reward[rough] = np.minimum(hold_value[rough], _OVER_HOLD_FLOOR)
+        phase[rough] = _DONE
+
+        settling = phase == _SETTLING
+        if self.require_ball_on_tray_when_lowered:
+            spilled = settling & ~ball_ok
+            self._ball_lost |= spilled
+            phase[spilled] = _DONE
+            settling &= ~spilled
+        settled = settling & (now >= self._settle_until)
+        self._completed |= settled & self._touch_in_window
+        self._final_reward[settled & self._touch_in_window] = 1.0
+        outside = settled & ~self._touch_in_window
+        self._early_placement |= outside & (self._touch_air_s < low)
+        self._late_placement |= outside & (self._touch_air_s >= low)
+        self._final_reward[outside] = self._touch_value[outside]
+        phase[settled] = _DONE
+        self._needs_handles = bool(np.any((phase == _HOLDING) & ~lifted))
+
+        # A lost ball leaves the final reward at 0; success sets it to 1.
+        reward = np.where(
+            phase == _DONE,
+            self._final_reward,
+            np.where(
+                phase == _SETTLING,
+                self._touch_value,
+                np.where(phase == _HOLDING, hold_value, 0.0),
+            ),
+        )
+        return TaskEvalResult(
+            reward=reward,
+            success=self._completed.copy(),
+            metrics={
+                **metrics,
+                "current_balanced": current_balanced.copy(),
+                "tray_lift_m": tray_lift,
+                "lifted": lifted.copy(),
+                "continuous_hold_s": air_s,
+                "hold_duration_s": self._hold_duration_s.copy(),
+                "hold_window_s": np.broadcast_to(
+                    np.asarray(self.hold_window_s), (self._nworld, 2)
                 ).copy(),
-                "ball_radius_m": np.full(
-                    (self._nworld,),
-                    self._ball_radius_m,
-                    dtype=np.float32,
-                ),
+                "hold_complete": self._hold_complete.copy(),
+                "ball_lost_after_hold": self._ball_lost.copy(),
+                "handles_held": handles_held,
+                "settling": phase == _SETTLING,
+                "early_placement": self._early_placement.copy(),
+                "late_placement": self._late_placement.copy(),
+                "rough_placement": self._rough_placement.copy(),
+                "ever_success": self._completed.copy(),
+                **self._shape_metrics(),
             },
         )

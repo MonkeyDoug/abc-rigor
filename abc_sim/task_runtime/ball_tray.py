@@ -8,7 +8,11 @@ from typing import Any
 import mujoco
 import numpy as np
 
-from abc_sim.task_eval.ball_tray import format_hold_prompt
+from abc_sim.task_eval.ball_tray import (
+    HOLD_WINDOW_S,
+    format_hold_prompt,
+    format_window_prompt,
+)
 from abc_sim.task_eval.base import TaskEvalResult
 
 _DEFAULT_DURATION_S = 12
@@ -39,12 +43,13 @@ class BallTrayBalancingRuntime:
         self._ball_body_id: int | None = None
         self._tray_center_site_id: int | None = None
         self._duration_s = _DEFAULT_DURATION_S
+        self._window_s: tuple[float, float] | None = HOLD_WINDOW_S
         self._started_at_s: float | None = None
         self._deadline_s: float | None = None
         self._grip_detected_at_s: float | None = None
         self._last_both_handles_contact_at_s: float | None = None
         self._remaining_s: float | None = None
-        self._display_prompt = format_hold_prompt(self._duration_s)
+        self._display_prompt = self.observation_prompt()
         self._state = "waiting_for_lift"
         self._contacted_handles: dict[str, tuple[str, ...]] = {"left": (), "right": ()}
         self._perturbation_rng = np.random.default_rng(0)
@@ -97,7 +102,7 @@ class BallTrayBalancingRuntime:
         self._grip_detected_at_s = None
         self._last_both_handles_contact_at_s = None
         self._remaining_s = float(self._duration_s)
-        self._display_prompt = format_hold_prompt(self._duration_s)
+        self._display_prompt = self.observation_prompt()
         self._state = "waiting_for_lift"
         self._contacted_handles = {"left": (), "right": ()}
         seed = int(getattr(randomization, "seed", 0) or 0)
@@ -124,10 +129,18 @@ class BallTrayBalancingRuntime:
         """Consume the environment's authoritative hold-and-lower score."""
         self._balance_result = result
         self._duration_s = float(result.metrics["hold_duration_s"][0])
+        window = result.metrics.get("hold_window_s")
+        self._window_s = (
+            tuple(map(float, window[0]))
+            if window is not None and np.all(np.isfinite(window[0]))
+            else None
+        )
         self._update_display()
 
     def observation_prompt(self) -> str:
-        """Use the episode's required duration throughout the policy rollout."""
+        """Use the episode's hold requirement throughout the policy rollout."""
+        if self._window_s is not None:
+            return format_window_prompt(self._window_s)
         return format_hold_prompt(self._duration_s)
 
     def before_step(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
@@ -355,7 +368,11 @@ class BallTrayBalancingRuntime:
             self._display_prompt = "Task complete"
         elif bool(metrics["hold_complete"][0]):
             self._state = "lowering"
-            self._display_prompt = "Lower the tray onto the table"
+            self._display_prompt = (
+                "Gently place the tray on the table"
+                if self._window_s is not None
+                else "Lower the tray onto the table"
+            )
         elif bool(metrics["lifted"][0]) and bool(metrics["current_balanced"][0]):
             self._state = "counting_down"
             self._display_prompt = f"Balance: {math.ceil(self._remaining_s)}s"

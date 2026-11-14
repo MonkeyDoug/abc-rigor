@@ -5,7 +5,11 @@ from typing import Any, ClassVar
 import mujoco
 import numpy as np
 
-from abc_sim.task_eval.ball_tray import format_hold_prompt, sample_hold_duration_s
+from abc_sim.task_eval.ball_tray import (
+    HOLD_WINDOW_S,
+    format_window_prompt,
+    sample_hold_duration_s,
+)
 
 from ..core import PerturbRange, RandomizationState, SceneRandomizer
 
@@ -140,7 +144,7 @@ class BallTrayBalancingRandomizer(SceneRandomizer):
                 _BALL_TRAY_BALL_JOINT: ball_scale,
             },
             metadata={
-                "prompt": format_hold_prompt(balance_duration_s),
+                "prompt": format_window_prompt(HOLD_WINDOW_S),
                 "prompt_type": "ball_tray_balancing",
                 "ball_body": _BALL_TRAY_BALL_BODY,
                 "ball_joint": _BALL_TRAY_BALL_JOINT,
@@ -162,6 +166,7 @@ class BallTrayBalancingRandomizer(SceneRandomizer):
                 "ball_angular_velocity": angular_velocity.tolist(),
                 "balance_duration_s": balance_duration_s,
                 "hold_duration_s": balance_duration_s,
+                "hold_window_s": list(HOLD_WINDOW_S),
                 "hold_duration_range_s": list(_BALL_TRAY_COUNTDOWN_DURATION_RANGE_S),
                 "balance_duration_range_s": list(_BALL_TRAY_COUNTDOWN_DURATION_RANGE_S),
             },

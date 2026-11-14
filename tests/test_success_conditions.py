@@ -23,6 +23,11 @@ from abc_sim.task_eval.put_relative import PutRelativeEvaluator
 from abc_sim.task_runtime.ball_tray import BallTrayBalancingRuntime
 from abc_sim.task_specs import get_task_spec
 
+WINDOW_PROMPT = (
+    "keep the ball balanced on the tray for 10 to 15 seconds, "
+    "then gently place the tray on the table"
+)
+
 
 def body(name, joint, pos, extra=""):
     return (
@@ -69,6 +74,8 @@ class BallTrayTest(unittest.TestCase):
         self.use_evaluator()
 
     def use_evaluator(self, **options):
+        # These cover the sampled "at least X seconds" hold; tests/test_ball_tray_window.py covers the default.
+        options.setdefault("hold_window_s", None)
         self.evaluator = BallTrayBalancingEvaluator(
             model=self.model, spec=get_task_spec("ball_tray_balancing"), **options
         )
@@ -236,10 +243,10 @@ class BallTrayTest(unittest.TestCase):
             with self.subTest(seed=seed):
                 state = randomizer.randomize(self.model, self.data, seed=seed)
                 duration = state.metadata["hold_duration_s"]
+                self.assertEqual(state.metadata["prompt"], WINDOW_PROMPT)
                 prompt = (
                     f"balance the ball in the tray for at least {duration:g} seconds"
                 )
-                self.assertEqual(state.metadata["prompt"], prompt)
                 self.assertEqual(state.metadata["balance_duration_s"], duration)
                 self.evaluator.reset()
                 self.evaluator.configure_from_randomization(self.model, state)
@@ -297,14 +304,10 @@ class BallTrayTest(unittest.TestCase):
                     side_effect=evaluate,
                 ) as score,
             ):
-                obs, info = env.reset(seed=4)
+                obs, _ = env.reset(seed=4)
                 self.assertEqual(score.call_count, 1)
-                duration = info["randomization"].metadata["hold_duration_s"]
-                self.assertEqual(
-                    obs["prompt"],
-                    f"balance the ball in the tray for at least {duration:g} seconds",
-                )
-                self.assertEqual(env.task_runtime_debug_state()["duration_s"], duration)
+                self.assertEqual(obs["prompt"], WINDOW_PROMPT)
+                self.assertEqual(env.task_runtime_debug_state()["duration_s"], 10.0)
                 _, reward, _, _, step_info = env.step(np.empty(0), render_obs=False)
                 self.assertEqual(score.call_count, 5)
                 self.assertIs(env._task_runtime._balance_result, env._step_task_eval)

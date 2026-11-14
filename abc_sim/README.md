@@ -275,13 +275,15 @@ real measurement. The unscored four — `put_markers_in_top_drawer`,
 score themselves: they warn at startup and report reward 0 and success 0
 throughout. Watch the videos to judge those.
 
-`ball_tray_balancing` samples a required hold duration from 5–15 seconds in
-half-second increments and includes it in the episode prompt. Keep the tray
-centre at least 5 cm above its reset height and the ball within the tray for
-that duration without interruption, then lower the tray into a new table
-contact. An interruption restarts the hold; ball position no longer affects
-completion after the hold finishes. Success latches after lowering and ends
-the rollout early. `--num-chunks` sets the time budget for completing the task;
+`ball_tray_balancing` asks the policy to keep the ball balanced on the tray for
+10 to 15 seconds, then gently place the tray on the table. The hold counts while
+the tray centre is at least 5 cm above its reset height, with the ball within
+the tray and no gripper touching it. Placing the tray with both handles gripped
+after 10–15 seconds up, then keeping the ball on it for 1 second, succeeds.
+Placing earlier or later keeps the partial reward reached (0.9 × seconds / 10
+up to 10 s, falling from 0.9 to 0.5 after 15 s) without success; touching or
+losing the ball after 10 seconds scores 0. Success latches and ends the rollout
+early. `--num-chunks` sets the time budget for completing the task;
 it does not set the required hold duration.
 
 See [the success conditions](../docs/success_conditions.md) for the scoring
