@@ -15,11 +15,12 @@ import os
 import socket
 import sys
 import time
+from pathlib import Path
 
 import bmesh
 import bpy
-from mathutils import Matrix, Vector
 import numpy as np
+from mathutils import Matrix, Vector
 
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -79,7 +80,7 @@ scene.frame_set(frames[0])
 
 # --------------------------------------------------------------------------- what each geom is
 PROP_KINDS = {"bead", "abs", "bin_plastic", "ceramic", "paper", "textured_prop", "prop", "wire_rack",
-              "steel", "rubber", "painted_metal", "bristle"}
+              "steel", "rubber", "painted_metal", "bristle", "wood_block"}
 
 
 def classify(g):
@@ -90,7 +91,7 @@ def classify(g):
         return "floor"
     if mesh == "base_visual_gate":
         return "aluminium"
-    if geom == "play_table":
+    if geom == "play_table" or g.get("body") == "play_table":
         return "table"
     if mesh == "camera_d405":
         return "camera"
@@ -117,6 +118,8 @@ def classify(g):
         return "paper"
     if mat == "brush_handle_mat":                    # exporter swaps the brush names; this is the bristle colour
         return "bristle"
+    if mat == "block_mat" and mesh.startswith("block_") and g["textured"]:
+        return "wood_block"
     return "textured_prop" if g["textured"] else "prop"
 
 
@@ -166,6 +169,7 @@ def color_variation(mat, bsdf, base, amount, scale, bump=0.0):
     if bump > 0:
         b = nt.nodes.new("ShaderNodeBump")
         b.inputs["Strength"].default_value = bump
+        b.inputs["Distance"].default_value = 0.001
         nt.links.new(noise.outputs["Fac"], b.inputs["Height"])
         nt.links.new(b.outputs["Normal"], bsdf.inputs["Normal"])
 
@@ -211,6 +215,7 @@ def floor_tiles(mat, bsdf):
     nt.links.new(mr.outputs["Result"], bsdf.inputs["Roughness"])
     bump = nt.nodes.new("ShaderNodeBump")
     bump.inputs["Strength"].default_value = 0.25
+    bump.inputs["Distance"].default_value = 0.003
     bump.invert = True
     nt.links.new(brick.outputs["Fac"], bump.inputs["Height"])
     nt.links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
@@ -246,10 +251,10 @@ def apply_material(mat, kind):
         set_in(bsdf, "Anisotropic", 0.6)
         roughness_variation(mat, bsdf, 0.24, 0.36, 150.0)
     elif kind == "camera":
-        set_in(bsdf, "Base Color", (0.03, 0.03, 0.035, 1.0))
-        set_in(bsdf, "Metallic", 0.3)
-        set_in(bsdf, "Roughness", 0.45)
-        bevel(mat, bsdf, 0.001)
+        set_in(bsdf, "Base Color", (0.67, 0.69, 0.72, 1.0))
+        set_in(bsdf, "Metallic", 0.9)
+        set_in(bsdf, "Roughness", 0.30)
+        bevel(mat, bsdf, 0.00025)
     elif kind == "robot_white":
         set_in(bsdf, "Base Color", (0.82, 0.82, 0.83, 1.0))
         set_in(bsdf, "Coat Weight", 0.3)
@@ -260,7 +265,7 @@ def apply_material(mat, kind):
         set_in(bsdf, "Base Color", (0.04, 0.04, 0.045, 1.0))
         set_in(bsdf, "Specular IOR Level", 0.35)
         roughness_variation(mat, bsdf, 0.45, 0.62, 60.0)
-        bevel(mat, bsdf, 0.0015)
+        bevel(mat, bsdf, 0.0004)
     elif kind == "bead":
         set_in(bsdf, "Roughness", 0.12)
         set_in(bsdf, "Coat Weight", 1.0)
@@ -296,9 +301,11 @@ def apply_material(mat, kind):
     elif kind == "bristle":
         set_in(bsdf, "Roughness", 0.7)
         set_in(bsdf, "Sheen Weight", 0.4)
-    elif kind == "textured_prop":
+    elif kind in ("textured_prop", "wood_block"):
         set_in(bsdf, "Roughness", 0.45)
         set_in(bsdf, "Coat Weight", 0.15)
+        if kind == "wood_block":
+            bevel(mat, bsdf, 0.0002)
     else:
         set_in(bsdf, "Roughness", 0.45)
         set_in(bsdf, "Coat Weight", 0.1)
@@ -322,8 +329,10 @@ for obj in scene.objects:
         obj.hide_render = True                       # replaced by a large tiled ground plane
     if kind in PROP_KINDS:
         props.append(obj)
-    obj.data.shade_smooth()
-    if kind not in ("wall", "floor", "table"):
+    if kind in ("wall", "floor", "table"):
+        obj.data.shade_flat()
+    else:
+        obj.data.shade_smooth()
         obj.modifiers.new("EdgeSplit", "EDGE_SPLIT").split_angle = math.radians(32.0)
     for slot in obj.material_slots:
         if slot.material and slot.material.node_tree:
@@ -377,46 +386,96 @@ if not args.keep_long_tris:
             bpy.data.libraries.write(tmp, {obj.data}, fake_user=True)
             os.replace(tmp, cache)
 
-# the sim has no bracket between gripper and wrist camera: add a black bar so the D405 does not float
+# Camera accessories use the recorded optical frame, independent of mesh principal axes.
 mount = bpy.data.materials.new("CameraMount")
 mount.use_nodes = True
 set_in(bsdf_of(mount), "Base Color", (0.02, 0.02, 0.022, 1.0))
-set_in(bsdf_of(mount), "Roughness", 0.75)
-for side in ("left", "right"):
+set_in(bsdf_of(mount), "Roughness", 0.55)
+panel_mat = bpy.data.materials.new("D405FrontPanel")
+panel_mat.use_nodes = True
+set_in(bsdf_of(panel_mat), "Base Color", (0.007, 0.008, 0.009, 1.0))
+set_in(bsdf_of(panel_mat), "Roughness", 0.28)
+lens_mat = bpy.data.materials.new("D405LensGlass")
+lens_mat.use_nodes = True
+set_in(bsdf_of(lens_mat), "Base Color", (0.006, 0.012, 0.015, 1.0))
+set_in(bsdf_of(lens_mat), "Roughness", 0.08)
+set_in(bsdf_of(lens_mat), "Coat Weight", 1.0)
+
+
+def attach_optical(obj, anchor, optical_world, material):
+    """Attach metre-scale optical-frame geometry to an animated render camera."""
+    obj.matrix_world = optical_world
+    obj.parent = anchor
+    obj.matrix_parent_inverse = anchor.matrix_world.inverted()
+    obj.data.materials.clear()
+    obj.data.materials.append(material)
+
+
+for side in ("top", "left", "right"):
     cams = [o for o, g in by_body.get(f"{side}_camera_d405", []) if g.get("mesh") == "camera_d405"]
-    bases = [o for o, g in by_body.get(f"{side}_link_6", []) if g.get("mesh") == "model2__12"]
     anchor = bpy.data.objects.get(f"Camera_{side}")
-    if not bases or not (cams or anchor):
+    if anchor is None:
         continue
+    loc, rot, _ = anchor.matrix_world.decompose()
+    optical_world = Matrix.Translation(loc) @ rot.to_matrix().to_4x4() @ Matrix.Rotation(math.pi, 4, "X")
     if not cams:
-        # scenes that hide the D405 housing: build one behind the recorded camera (42 x 42 x 23 mm),
-        # lens along local +Z like the exported mesh, so the bar code below applies unchanged
+        # The optical origin is at one lens; the 42 mm housing is centred 9 mm to its right.
         bpy.ops.mesh.primitive_cube_add(size=1.0)
         body = bpy.context.active_object
         body.name = f"{side}_camera_body"
-        body.data.transform(Matrix.Diagonal((0.042, 0.042, 0.023, 1.0)) @ Matrix.Translation((0.0, 0.0, -0.5)))
-        loc, rot, _ = anchor.matrix_world.decompose()          # ignore any import scale on the camera
-        body.matrix_world = Matrix.Translation(loc) @ rot.to_matrix().to_4x4() @ Matrix.Rotation(math.pi, 4, "X")
-        body.parent = anchor
-        body.matrix_parent_inverse = anchor.matrix_world.inverted()
-        body.data.materials.append(mount)
-        cams = [body]
-    cam_obj, base_obj = cams[0], bases[0]
-    coords = [v.co for v in cam_obj.data.vertices]          # bound_box lags behind mesh edits
-    lo = Vector(min(c[i] for c in coords) for i in range(3))
-    hi = Vector(max(c[i] for c in coords) for i in range(3))
-    back = cam_obj.matrix_world @ Vector(((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0, lo.z))   # back face: lens is +Z
-    b = centre(base_obj)
-    d = (b - back).normalized()
-    a, e = back - d * 0.004, b - d * 0.02                    # one bar, from just inside the back face into the base
-    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(a + e) / 2.0)
-    bar = bpy.context.active_object
-    bar.name = f"{side}_camera_mount"
-    bar.scale = (0.022, 0.016, (e - a).length)
-    bar.rotation_euler = (e - a).to_track_quat("Z", "Y").to_euler()
-    bar.data.materials.append(mount)
-    bar.parent = cam_obj
-    bar.matrix_parent_inverse = cam_obj.matrix_world.inverted()
+        body.data.transform(Matrix.Translation((0.009, 0.0, -0.0115)) @ Matrix.Diagonal((0.042, 0.042, 0.023, 1.0)))
+        housing_mat = bpy.data.materials.new(f"D405Housing_{side}")
+        housing_mat.use_nodes = True
+        apply_material(housing_mat, "camera")
+        attach_optical(body, anchor, optical_world, housing_mat)
+
+    # A rounded black face leaves the aluminium perimeter exposed.
+    radius, half = 0.0045, 0.0195
+    contour = []
+    for cx, cy, start in ((half-radius, half-radius, 0), (-half+radius, half-radius, 90),
+                          (-half+radius, -half+radius, 180), (half-radius, -half+radius, 270)):
+        for j in range(13):
+            angle = math.radians(start + 90*j/12)
+            contour.append((0.009 + cx + radius*math.cos(angle), cy + radius*math.sin(angle), 0.00002))
+    mesh = bpy.data.meshes.new(f"{side}_d405_face")
+    mesh.from_pydata(contour, [], [tuple(range(len(contour)))])
+    panel = bpy.data.objects.new(f"{side}_d405_face", mesh)
+    scene.collection.objects.link(panel)
+    attach_optical(panel, anchor, optical_world, panel_mat)
+    for index, x in enumerate((0.0, 0.018)):
+        bpy.ops.mesh.primitive_cylinder_add(vertices=48, radius=0.0036, depth=0.0006)
+        ring = bpy.context.active_object
+        ring.name = f"{side}_d405_lens_ring_{index}"
+        ring.data.transform(Matrix.Translation((x, 0.0, 0.00035)))
+        attach_optical(ring, anchor, optical_world, mount)
+        bpy.ops.mesh.primitive_uv_sphere_add(segments=24, ring_count=12, radius=1.0)
+        lens = bpy.context.active_object
+        lens.name = f"{side}_d405_lens_{index}"
+        lens.data.transform(Matrix.Translation((x, 0.0, 0.00065)) @ Matrix.Diagonal((0.0025, 0.0025, 0.0004, 1.0)))
+        lens.data.shade_smooth()
+        attach_optical(lens, anchor, optical_world, lens_mat)
+    if side in ("left", "right"):
+        for part in ("bracket", "cable_holder"):
+            filename = "d405_crank_bracket.stl" if part == "bracket" else "d405_cable_holder.stl"
+            bpy.ops.wm.stl_import(filepath=str(Path(__file__).with_name("assets") / filename))
+            obj = bpy.context.active_object
+            obj.name = f"{side}_camera_{part}"
+            attach_optical(obj, anchor, optical_world, mount)
+            obj.data.shade_smooth()
+            obj.modifiers.new("EdgeSplit", "EDGE_SPLIT").split_angle = math.radians(32.0)
+        # A short adapter seats the CAD foot on ABC's older gripper at its recorded camera pose.
+        foot = Vector((-0.0017, 0.0403845, 0.0239802))
+        seat = Vector((-0.0017, 0.0374570, 0.0268150))
+        axis = seat - foot
+        bpy.ops.mesh.primitive_cube_add(size=1.0)
+        spacer = bpy.context.active_object
+        spacer.name = f"{side}_camera_spacer"
+        spacer.data.transform(
+            Matrix.Translation((foot + seat) / 2.0)
+            @ axis.to_track_quat("Z", "Y").to_matrix().to_4x4()
+            @ Matrix.Diagonal((0.050, 0.006, axis.length + 0.003, 1.0))
+        )
+        attach_optical(spacer, anchor, optical_world, mount)
 
 
 def in_workspace(p):
