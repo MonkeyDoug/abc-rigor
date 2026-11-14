@@ -607,6 +607,25 @@ class LegoToleranceTest(unittest.TestCase):
         self.assertTrue(self.result(0.0049).scalar_success())
         self.assertFalse(self.result(0.0051).scalar_success())
 
+    def scores(self, **block_x):
+        """Strict and lenient (reward, success) with each named block moved to that bin's x (0 red, 1 yellow, 2 blue)."""
+        for color, x in block_x.items():
+            position(self.model, self.data, f"{color}_lego_1_joint", [x, 0, 0.2])
+        lenient = LegoBlocksSortingEvaluator(
+            model=self.model, spec=get_task_spec("lego blocks sorting"), penalize_wrong_bin=False
+        )
+        qpos = self.data.qpos[None, :]
+        return [(round(float(r.reward[0]), 4), r.scalar_success()) for r in (
+            self.evaluator.evaluate_qpos_batch(qpos), lenient.evaluate_qpos_batch(qpos))]
+
+    def test_wrong_bin_block_is_penalized(self):
+        # Fixture: every block starts in its own bin.
+        self.assertEqual(self.scores(), [(1.0, True), (1.0, True)])
+        # Blue into the red bin: 2 correct - 1 wrong; lenient ignores the wrong one.
+        self.assertEqual(self.scores(blue=0), [(round(1 / 3, 4), False), (round(2 / 3, 4), False)])
+        # Yellow into the red bin too: 1 correct - 2 wrong, clipped at 0.
+        self.assertEqual(self.scores(blue=0, yellow=0), [(0.0, False), (round(1 / 3, 4), False)])
+
     def test_euclidean_corner_tolerance(self):
         self.assertFalse(self.result(0.004, 0.004).scalar_success())
         self.assertTrue(self.result(0.0028, 0.004).scalar_success())

@@ -24,10 +24,14 @@ class LegoBlocksSortingEvaluator:
         model: mujoco.MjModel,
         spec: SimTaskSpec,
         goal_tolerance_m: float = 0.005,
+        penalize_wrong_bin: bool = True,
     ) -> None:
         self.model = model
         self.spec = spec
         self.goal_tolerance_m = float(goal_tolerance_m)
+        # Each block in a wrong bin cancels one correctly sorted block in the reward (never below 0); off: only
+        # correctly sorted blocks count. Either way a wrong-bin block blocks success.
+        self.penalize_wrong_bin = bool(penalize_wrong_bin)
         if not np.isfinite(self.goal_tolerance_m) or self.goal_tolerance_m < 0.0:
             raise ValueError("goal_tolerance_m must be finite and nonnegative")
         self._block_qpos_addrs: dict[str, np.ndarray] = {}
@@ -198,7 +202,10 @@ class LegoBlocksSortingEvaluator:
             }
         )
         return TaskEvalResult(
-            reward=(num_correct / np.maximum(total_blocks, 1)).astype(np.float32),
+            reward=(
+                np.maximum(num_correct - (num_wrong_bin if self.penalize_wrong_bin else 0), 0)
+                / np.maximum(total_blocks, 1)
+            ).astype(np.float32),
             success=success,
             metrics=metrics,
         )
