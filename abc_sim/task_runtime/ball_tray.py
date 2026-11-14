@@ -149,7 +149,7 @@ class BallTrayBalancingRuntime:
         self._apply_active_perturbation_force(data)
 
     def after_step(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
-        """Update perturbations after receiving this physics step's task score."""
+        """Update perturbations each physics step using the latest task score."""
 
         now_s = float(data.time)
         assert self._balance_result is not None

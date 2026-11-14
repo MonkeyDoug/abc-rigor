@@ -202,6 +202,24 @@ class ChessPlacementTest(unittest.TestCase):
                 self.nominals, np.random.default_rng(20082), _SEED_20082_BOARD
             )
 
+    def test_one_centimeter_clearance_is_rejected_without_physical_contact(self):
+        board = {
+            "pos": [0.6, 0.0, 0.75],
+            "quat": self.nominals["chessboard"][1],
+        }
+        board_edge_y = self.randomizer._board_footprint(board)[:, 1].max()
+        for clearance, too_close in ((0.01, True), (0.03, False)):
+            with self.subTest(clearance=clearance):
+                tin = {
+                    "pos": [0.6, board_edge_y + _TIN_HALF_XY[1] + clearance, 0.757],
+                    "quat": [1.0, 0.0, 0.0, 0.0],
+                }
+                self.apply(board, tin)
+                self.assertFalse(tin_board_contacts(self.model, self.data))
+                self.assertEqual(
+                    self.randomizer._tin_overlaps_board(tin, board), too_close
+                )
+
     def test_outer_reset_retries_placement_failure_and_reports_exhaustion(self):
         self.randomizer.perturbations = [
             p for p in self.randomizer.perturbations if p.joint_name in self.nominals
@@ -326,20 +344,46 @@ class ChessSceneResetTest(unittest.TestCase):
                 self.env.reset(seed=seed)
                 self.assertFalse(tin_board_contacts(self.env.model, self.env.data))
                 if self.env._last_randomization.metadata["tin_active"]:
-                    distance = mujoco.mj_geomDistance(
-                        self.env.model,
-                        self.env.data,
-                        self.env.model.geom("board_collision").id,
-                        self.env.model.geom("tin_box_floor").id,
-                        0.2,
-                        None,
+                    states = {
+                        name: {
+                            "pos": self.env.data.joint(name).qpos[:3].copy(),
+                            "quat": self.env.data.joint(name).qpos[3:].copy(),
+                        }
+                        for name in ("chessboard", "tin_box_joint")
+                    }
+                    self.assertFalse(
+                        self.env._task_randomizer._tin_overlaps_board(
+                            states["tin_box_joint"], states["chessboard"]
+                        ),
+                        f"Tin violates the 2 cm board clearance at seed {seed}",
                     )
-                    self.assertGreaterEqual(distance, 0.02 - 1e-8)
                     corners = geom_corners(
                         self.env.model, self.env.data, "tin_box_floor"
                     )[:, :2]
                     self.assertTrue(np.all(corners >= [0.34 - 1e-10, -0.65 - 1e-10]))
                     self.assertTrue(np.all(corners <= [0.84 + 1e-10, 0.65 + 1e-10]))
+
+    def test_single_color_resets_report_the_actual_material_color(self):
+        for color, material in (("white", "light_piece"), ("black", "dark_piece")):
+            for seed in (0, 20038):
+                with self.subTest(color=color, seed=seed):
+                    self.env.reset(
+                        seed=seed,
+                        options={"randomization": {"color_mode": f"{color}_only"}},
+                    )
+                    metadata = self.env._last_randomization.metadata
+                    self.assertEqual(metadata["target_colors"], [color])
+                    self.assertTrue(metadata["target_joints"])
+                    for joint in metadata["target_joints"]:
+                        body = self.env.model.jnt_bodyid[self.env.model.joint(joint).id]
+                        start = self.env.model.body_geomadr[body]
+                        count = self.env.model.body_geomnum[body]
+                        materials = {
+                            self.env.model.material(int(mat)).name
+                            for mat in self.env.model.geom_matid[start : start + count]
+                            if mat >= 0
+                        }
+                        self.assertEqual(materials, {material})
 
 
 if __name__ == "__main__":

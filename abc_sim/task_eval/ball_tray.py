@@ -68,6 +68,7 @@ class BallTrayBalancingEvaluator:
     """
 
     requires_step_updates = True
+    evaluate_at_control_rate = True
 
     def __init__(
         self,

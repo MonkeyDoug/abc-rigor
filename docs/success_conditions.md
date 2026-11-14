@@ -23,23 +23,32 @@
   for that duration without interruption. An invalid sample restarts the hold.
   Once the hold completes, ignore the ball and require a new tray–table contact
   at a later timestamp. Existing contact or repeated evaluation of the same
-  timestamp does not count as lowering. Completion is latched. Physics-step updates
-  prevent an interruption between control observations from being missed.
-  The environment owns the evaluator and shares its initial and physics-step
-  results with the runtime and step rewards. After each integration step it
-  refreshes position-dependent state so live scoring uses positions, site
-  transforms, and contacts from the same simulation state. Evaluator resets
+  timestamp does not count as lowering. Completion is latched.
+  The environment owns the evaluator and shares its initial and control-step
+  results with the runtime and step rewards. Ball-tray scoring refreshes
+  position-dependent state once per control step (normally 34 ms), and at the
+  end of any shorter explicit physics advance, so positions, site transforms,
+  and contacts agree. Lapses shorter than that sampling interval may be missed.
+  Runtime controls still run every physics step. Tasks without
+  `requires_step_updates` incur no extra position refresh while stepping;
+  contact-based evaluators refresh when explicitly scored. Evaluator resets
   and batch-width changes clear temporal state while retaining the configured duration.
   `evaluate_model_data` uses simulation time; qpos-only callers must supply
   `time_s` explicitly.
-- **Chess:** only the selected target squares must be occupied by upright pieces
+- **Chess:** the selected target squares must be occupied by upright pieces
   of the matching color and type. Pieces are interchangeable across the entire
-  same-color/type set. Match selected squares first, one-to-one; unselected
-  squares contribute only to full-board diagnostics. Reward is the fraction
-  of selected targets filled. Retain the existing board-relative position,
+  same-color/type set. Match selected squares first, one-to-one. By default,
+  every non-target home square must also remain filled; vacated home squares
+  reduce reward by one target's worth until restored. `require_home_squares=False`
+  restores selected-target-only success and reward. Retain the board-relative position,
   height, and upright tolerances.
-  In both chess scenes, swap the pieces' dark and light materials while
-  preserving their names, positions, meshes, and evaluator identities.
+  Both chess scenes place the white pieces on the robot's side to match the
+  intended real-world board orientation. Piece identities, `color_mode` and
+  `target_colors` agree with the visible materials: white is `light_piece`,
+  black is `dark_piece`. Body, joint, geom and mesh identifiers are renamed
+  together; positions, mesh files and physical geometry are unchanged.
+  Chess appearance therefore differs from simulation data rendered before
+  this PR's color swap.
 - **Relative placement:** allow zero separation along the requested direction.
   Keep the 30 cm upper limit, 8 cm perpendicular limit, and existing placement
   height check.

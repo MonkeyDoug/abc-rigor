@@ -280,7 +280,7 @@ class BallTrayTest(unittest.TestCase):
         self.assertTrue(runtime.debug_state()["complete"])
         self.assertEqual(runtime.observation_prompt(), prompt)
 
-    def test_env_shares_one_evaluation_per_physics_step_and_after_reset(self):
+    def test_env_shares_one_evaluation_per_control_step_and_after_reset(self):
         with tempfile.TemporaryDirectory() as directory:
             scene = Path(directory) / "tray.xml"
             mujoco.mj_saveLastXML(str(scene), self.model)
@@ -309,20 +309,20 @@ class BallTrayTest(unittest.TestCase):
                 self.assertEqual(obs["prompt"], WINDOW_PROMPT)
                 self.assertEqual(env.task_runtime_debug_state()["duration_s"], 10.0)
                 _, reward, _, _, step_info = env.step(np.empty(0), render_obs=False)
-                self.assertEqual(score.call_count, 5)
+                self.assertEqual(score.call_count, 2)
                 self.assertIs(env._task_runtime._balance_result, env._step_task_eval)
                 self.assertEqual(reward, env._step_task_eval.scalar_reward())
                 self.assertEqual(
                     step_info["task_success"], env._step_task_eval.scalar_success()
                 )
                 env.reset(seed=12)
-                self.assertEqual(score.call_count, 6)
+                self.assertEqual(score.call_count, 3)
                 self.assertFalse(env._step_task_eval.metrics["hold_complete"][0])
                 env.reload_from_model(env.model)
                 self.assertIsNone(env._step_task_eval)
                 self.assertIsNone(env._task_runtime._balance_result)
                 env.reset(seed=4)
-                self.assertEqual(score.call_count, 7)
+                self.assertEqual(score.call_count, 4)
                 self.assertIs(env._task_runtime._balance_result, env._step_task_eval)
 
     def test_env_preserves_hold_during_synchronized_tray_and_ball_motion(self):
