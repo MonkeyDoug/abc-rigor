@@ -52,12 +52,16 @@ class ChessBoardSetupEvaluator:
         position_tolerance_m: float = 0.028,
         height_tolerance_m: float = 0.05,
         upright_z_min: float = 0.85,
+        require_home_squares: bool = True,
     ) -> None:
         self.spec = spec
         self._board_joint_name = board_joint_name
         self.position_tolerance_m = float(position_tolerance_m)
         self.height_tolerance_m = float(height_tolerance_m)
         self.upright_z_min = float(upright_z_min)
+        # By default a same-type exchange may fill a target from another square only if that square
+        # is filled too; off: only the selected targets count, other squares stay diagnostic.
+        self.require_home_squares = bool(require_home_squares)
         self._directive: dict[str, Any] | None = None
         self._bind_model(model)
         self.reset(nworld=1)
@@ -277,12 +281,15 @@ class ChessBoardSetupEvaluator:
         targets_placed = placed[:, directive["target_indices"]]
         num_targets_placed = targets_placed.sum(axis=1).astype(np.int32)
         target_count = directive["selected_target_count"]
-        success = num_targets_placed == target_count
-        self._ever_success |= success
-
         num_non_target_disturbed = (
             (~placed[:, directive["non_target_indices"]]).sum(axis=1).astype(np.int32)
         )
+        success = num_targets_placed == target_count
+        credit = num_targets_placed
+        if self.require_home_squares:
+            success &= num_non_target_disturbed == 0
+            credit = num_targets_placed - num_non_target_disturbed
+        self._ever_success |= success
 
         placed_names = [
             [
@@ -293,7 +300,7 @@ class ChessBoardSetupEvaluator:
             for world in placed
         ]
         return TaskEvalResult(
-            reward=(num_targets_placed.astype(np.float32) / float(target_count)),
+            reward=np.clip(credit.astype(np.float32) / float(target_count), 0.0, 1.0),
             success=success,
             metrics={
                 "goal_configured": True,

@@ -66,8 +66,11 @@ class BallTrayTest(unittest.TestCase):
         )
         self.data = mujoco.MjData(self.model)
         self.randomization = SimpleNamespace(seed=12, metadata={"hold_duration_s": 5.0})
+        self.use_evaluator()
+
+    def use_evaluator(self, **options):
         self.evaluator = BallTrayBalancingEvaluator(
-            model=self.model, spec=get_task_spec("ball_tray_balancing")
+            model=self.model, spec=get_task_spec("ball_tray_balancing"), **options
         )
         self.evaluator.configure_from_randomization(self.model, self.randomization)
         self.sample(0)
@@ -85,7 +88,8 @@ class BallTrayTest(unittest.TestCase):
         mujoco.mj_forward(self.model, self.data)
         return self.evaluator.evaluate_model_data(self.model, self.data)
 
-    def test_hold_then_contact_ignores_ball_after_hold(self):
+    def test_lenient_hold_then_contact_ignores_ball_after_hold(self):
+        self.use_evaluator(require_ball_on_tray_when_lowered=False)
         self.sample(1, lifted=True)
         self.assertFalse(self.sample(5.99, lifted=True).scalar_success())
         reached = self.sample(6, lifted=True)
@@ -96,6 +100,23 @@ class BallTrayTest(unittest.TestCase):
         )
         self.assertTrue(self.sample(8, ball_inside=False).scalar_success())
         self.assertTrue(self.sample(9, lifted=True, ball_inside=False).scalar_success())
+
+    def test_ball_must_come_down_with_the_tray(self):
+        self.sample(1, lifted=True)
+        self.assertTrue(self.sample(6, lifted=True).metrics["hold_complete"][0])
+        lost = self.sample(7, lifted=True, ball_inside=False)
+        self.assertTrue(lost.metrics["ball_lost_after_hold"][0])
+        self.assertEqual(lost.reward[0], 0.0)
+        self.assertFalse(self.sample(8, ball_inside=False).scalar_success())
+        self.assertFalse(self.sample(9).scalar_success())  # putting the ball back does not undo the loss
+
+    def test_ball_kept_on_the_tray_completes(self):
+        self.sample(1, lifted=True)
+        self.sample(6, lifted=True)
+        self.assertFalse(self.sample(7, contact=False).scalar_success())
+        completed = self.sample(8)
+        self.assertTrue(completed.scalar_success())
+        self.assertEqual(completed.reward[0], 1.0)
 
     def test_interrupted_hold_restarts_and_can_retry(self):
         self.sample(1, lifted=True)
@@ -247,7 +268,7 @@ class BallTrayTest(unittest.TestCase):
         self.assertEqual(
             runtime.debug_state()["display_prompt"], "Lower the tray onto the table"
         )
-        runtime.on_task_evaluation(self.sample(7, ball_inside=False))
+        runtime.on_task_evaluation(self.sample(7))
         runtime.after_step(self.model, self.data)
         self.assertTrue(runtime.debug_state()["complete"])
         self.assertEqual(runtime.observation_prompt(), prompt)
@@ -349,8 +370,11 @@ class ChessTest(unittest.TestCase):
             + "</worldbody></mujoco>"
         )
         self.data = mujoco.MjData(self.model)
+        self.use_evaluator()
+
+    def use_evaluator(self, **options):
         self.evaluator = ChessBoardSetupEvaluator(
-            model=self.model, spec=get_task_spec("set up chess pieces on the board")
+            model=self.model, spec=get_task_spec("set up chess pieces on the board"), **options
         )
         self.configure_targets("white_pawn_1_jnt")
 
@@ -374,6 +398,24 @@ class ChessTest(unittest.TestCase):
     def result(self):
         return self.evaluator.evaluate_qpos_batch(self.data.qpos[None, :])
 
+    def test_filling_a_target_from_a_home_square_needs_that_square_filled(self):
+        # The equivalent pawn leaves its own home square to fill the target.
+        position(self.model, self.data, "white_pawn_2_jnt", self.goals["white_pawn_1_jnt"])
+        position(self.model, self.data, "white_pawn_1_jnt", [0.5, 0, 0.03])
+        robbed = self.result()
+        self.assertFalse(robbed.scalar_success())
+        self.assertEqual(robbed.metrics["num_non_target_disturbed"][0], 1)
+        self.assertEqual(robbed.reward[0], 0.0)
+        # Refill the vacated square with the displaced pawn: a valid exchange.
+        position(self.model, self.data, "white_pawn_1_jnt", self.goals["white_pawn_2_jnt"])
+        self.assertTrue(self.result().scalar_success())
+
+    def test_knocked_nontarget_piece_blocks_success(self):
+        position(self.model, self.data, "white_pawn_2_jnt", [0.5, 0, 0.03])
+        result = self.result()
+        self.assertFalse(result.scalar_success())
+        self.assertEqual(result.reward[0], 0.0)
+
     def test_selected_and_nonselected_same_class_can_swap(self):
         position(
             self.model, self.data, "white_pawn_1_jnt", self.goals["white_pawn_2_jnt"]
@@ -384,7 +426,8 @@ class ChessTest(unittest.TestCase):
         self.assertTrue(self.result().scalar_success())
         self.assertEqual(self.result().metrics["piece_count"], 3)
 
-    def test_nontarget_disturbance_does_not_block_success_or_reduce_reward(self):
+    def test_lenient_nontarget_disturbance_does_not_block_success_or_reduce_reward(self):
+        self.use_evaluator(require_home_squares=False)
         position(self.model, self.data, "white_pawn_2_jnt", [0.5, 0, 0.03])
         result = self.result()
         self.assertTrue(result.scalar_success())
@@ -401,7 +444,8 @@ class ChessTest(unittest.TestCase):
         self.assertEqual(result.reward[0], 0.0)
         self.assertEqual(result.metrics["num_non_target_disturbed"][0], 0)
 
-    def test_selected_square_takes_priority_over_nonselected_square(self):
+    def test_lenient_selected_square_takes_priority_over_nonselected_square(self):
+        self.use_evaluator(require_home_squares=False)
         position(self.model, self.data, "white_pawn_1_jnt", [0.5, 0, 0.03])
         # This equivalent pawn is closer to the unselected square, but it can
         # fill the selected square. The unselected square must not consume it.
@@ -411,7 +455,8 @@ class ChessTest(unittest.TestCase):
         self.assertEqual(result.metrics["targets_placed"], [["white_pawn_1_jnt"]])
         self.assertEqual(result.metrics["num_non_target_disturbed"][0], 1)
 
-    def test_upright_equivalent_piece_can_fill_target_beside_toppled_piece(self):
+    def test_lenient_upright_equivalent_piece_can_fill_target_beside_toppled_piece(self):
+        self.use_evaluator(require_home_squares=False)
         address = int(self.model.jnt_qposadr[self.model.joint("white_pawn_1_jnt").id])
         self.data.qpos[address + 3 : address + 7] = [0, 1, 0, 0]
         position(self.model, self.data, "white_pawn_2_jnt", [0.026, 0, 0.03])
