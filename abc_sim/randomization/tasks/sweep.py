@@ -102,6 +102,7 @@ class SweepRandomizer(SceneRandomizer):
                 1
                 for joint_name in self._all_trash_joints
                 if joint_name in state.object_states
+                and float(state.object_states[joint_name]["pos"][0]) >= 0.0
                 and float(state.object_states[joint_name]["pos"][2]) >= 0.0
             )
             trash_count = min(max(trash_count, self.min_trash_count), self.max_trash_count)
@@ -110,13 +111,8 @@ class SweepRandomizer(SceneRandomizer):
         self._set_active_trash_count(trash_count)
 
         object_states = dict(state.object_states)
-        object_states.update(
-            {
-                joint_name: parked_state
-                for joint_name, parked_state in self._inactive_trash_states().items()
-                if joint_name not in object_states
-            }
-        )
+        # Normalize saved below-plane parking positions when replaying old resets.
+        object_states.update(self._inactive_trash_states())
         full_state = RandomizationState(
             seed=state.seed,
             object_states=object_states,
@@ -183,7 +179,9 @@ class SweepRandomizer(SceneRandomizer):
         states: dict[str, dict[str, list[float]]] = {}
         for index, joint_name in enumerate(self._inactive_trash_joints()):
             states[joint_name] = {
-                "pos": [-1.5 - 0.1 * index, 0.0, -1.0 - 0.1 * index],
+                # The table collision plane extends beyond its visible edges.
+                # Inactive balls settle on it outside the workspace.
+                "pos": [-1.5 - 0.1 * index, 0.0, 0.80],
                 "quat": [1.0, 0.0, 0.0, 0.0],
             }
         return states

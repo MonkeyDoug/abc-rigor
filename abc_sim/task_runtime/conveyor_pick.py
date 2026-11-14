@@ -1,4 +1,9 @@
-"""Runtime controller for the conveyor pick task."""
+"""Runtime controller for the conveyor pick task.
+
+An object that leaves the belt for the table, floor or a wall is off the track: it is removed from the scene (parked
+on the floor behind the back wall, out of every camera's view), so objects that ride off the belt's end cannot pile
+up within reach and be put in the bin afterwards.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +25,20 @@ _ROLLER_SPEED = 6.0
 _DEFAULT_BELT_SPEED_Y = -0.20
 _BELT_CONTACT_MAX_DISTANCE_M = 0.0
 _BELT_CONTACT_ANGULAR_DAMPING = 0.0
+# Scene geoms an object only touches once it has left the belt (rails, rollers, the bin and the robot do not count).
+_OFF_TRACK_GEOMS = (
+    "table_collision",
+    "floor_collision",
+    "back_wall_collision",
+    "left_wall_collision",
+    "right_wall_collision",
+)
+# Removed objects rest on the floor at x = REMOVED_OBJECT_X, one per y slot; the evaluator treats any object past
+# REMOVED_OBJECT_MIN_X as removed.
+REMOVED_OBJECT_X = 3.0
+REMOVED_OBJECT_MIN_X = 2.0
+_REMOVED_OBJECT_SPACING_Y = 0.5
+_REMOVED_OBJECT_DROP_Z = 0.2
 
 
 class ConveyorPickRuntime:
@@ -29,7 +48,9 @@ class ConveyorPickRuntime:
         self._object_controls: tuple[tuple[int, int, tuple[int, ...]], ...] | None = None
         self._roller_actuators: tuple[int, ...] | None = None
         self._belt_geom_id: int | None = None
+        self._off_track_geom_ids: frozenset[int] | None = None
         self._last_active_objects: tuple[int, ...] = ()
+        self._removed_objects: tuple[int, ...] = ()
         self._belt_speed_y = _DEFAULT_BELT_SPEED_Y
 
     def bind(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
@@ -38,7 +59,9 @@ class ConveyorPickRuntime:
         self._object_controls = None
         self._roller_actuators = None
         self._belt_geom_id = None
+        self._off_track_geom_ids = None
         self._last_active_objects = ()
+        self._removed_objects = ()
 
     def after_reset(
         self,
@@ -50,6 +73,7 @@ class ConveyorPickRuntime:
         """Clear runtime bookkeeping after reset."""
 
         self._last_active_objects = ()
+        self._removed_objects = ()
         self._belt_speed_y = self._speed_from_randomization(randomization)
         self._open_idle_grippers(model, data)
         mujoco.mj_forward(model, data)
@@ -80,16 +104,25 @@ class ConveyorPickRuntime:
         self._last_active_objects = tuple(active_objects)
 
     def after_step(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
-        """Keep belt-carried objects from accumulating rotation."""
+        """Remove objects that went off the track; keep belt-carried objects from accumulating rotation."""
 
         active_objects: list[int] = []
-        for idx, (_qpos_adr, qvel_adr, geom_ids) in enumerate(
+        removed = list(self._removed_objects)
+        for idx, (qpos_adr, qvel_adr, geom_ids) in enumerate(
             self._object_controls_for(model),
             start=1,
         ):
-            if self._geoms_contact_belt(model, data, geom_ids):
+            if idx in removed:
+                continue
+            if self._geoms_contact_any(data, geom_ids, self._off_track_geoms_for(model)):
+                self._remove_object(data, idx, qpos_adr, qvel_adr)
+                removed.append(idx)
+            elif self._geoms_contact_belt(model, data, geom_ids):
                 self._damp_angular_velocity(data, qvel_adr)
                 active_objects.append(idx)
+        if len(removed) != len(self._removed_objects):
+            self._removed_objects = tuple(removed)
+            mujoco.mj_forward(model, data)
         self._last_active_objects = tuple(active_objects)
 
     def debug_state(self) -> dict[str, Any]:
@@ -97,6 +130,7 @@ class ConveyorPickRuntime:
 
         return {
             "active_objects": self._last_active_objects,
+            "removed_objects": self._removed_objects,
             "belt_speed_y": self._belt_speed_y,
             "belt_speed_m_s": abs(self._belt_speed_y),
             "belt_direction_y": float(np.sign(self._belt_speed_y)),
@@ -155,6 +189,12 @@ class ConveyorPickRuntime:
             data.qpos[model.jnt_qposadr[right_joint]] = float(model.jnt_range[right_joint][0])
             data.ctrl[gripper_actuator] = float(model.actuator_ctrlrange[gripper_actuator][1])
 
+    @staticmethod
+    def _remove_object(data: mujoco.MjData, idx: int, qpos_adr: int, qvel_adr: int) -> None:
+        y = (idx - (_OBJECT_COUNT + 1) / 2) * _REMOVED_OBJECT_SPACING_Y
+        data.qpos[qpos_adr : qpos_adr + 7] = (REMOVED_OBJECT_X, y, _REMOVED_OBJECT_DROP_Z, 1.0, 0.0, 0.0, 0.0)
+        data.qvel[qvel_adr : qvel_adr + 6] = 0.0
+
     def _damp_angular_velocity(self, data: mujoco.MjData, qvel_adr: int) -> None:
         data.qvel[qvel_adr + 3 : qvel_adr + 6] *= _BELT_CONTACT_ANGULAR_DAMPING
 
@@ -168,6 +208,18 @@ class ConveyorPickRuntime:
 
         self._belt_geom_id = int(geom_id)
         return self._belt_geom_id
+
+    def _off_track_geoms_for(self, model: mujoco.MjModel) -> frozenset[int]:
+        if self._off_track_geom_ids is not None:
+            return self._off_track_geom_ids
+
+        geom_ids = {name: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in _OFF_TRACK_GEOMS}
+        missing = [name for name, geom_id in geom_ids.items() if geom_id < 0]
+        if missing:
+            raise RuntimeError("conveyor_pick scene is missing off-track geoms: " + ", ".join(missing))
+
+        self._off_track_geom_ids = frozenset(int(geom_id) for geom_id in geom_ids.values())
+        return self._off_track_geom_ids
 
     def _roller_actuators_for(self, model: mujoco.MjModel) -> tuple[int, ...]:
         if self._roller_actuators is not None:
@@ -240,6 +292,22 @@ class ConveyorPickRuntime:
 
         self._object_controls = tuple(controls)
         return self._object_controls
+
+    @staticmethod
+    def _geoms_contact_any(
+        data: mujoco.MjData,
+        geom_ids: tuple[int, ...],
+        others: frozenset[int],
+    ) -> bool:
+        object_geom_ids = set(geom_ids)
+        for contact_idx in range(data.ncon):
+            contact = data.contact[contact_idx]
+            if float(contact.dist) > _BELT_CONTACT_MAX_DISTANCE_M:
+                continue
+            geom1, geom2 = int(contact.geom1), int(contact.geom2)
+            if (geom1 in object_geom_ids and geom2 in others) or (geom2 in object_geom_ids and geom1 in others):
+                return True
+        return False
 
     def _geoms_contact_belt(
         self,

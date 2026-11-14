@@ -8,6 +8,7 @@ import mujoco
 import numpy as np
 
 from abc_sim.task_eval.base import TaskEvalResult
+from abc_sim.task_runtime.conveyor_pick import REMOVED_OBJECT_MIN_X
 from abc_sim.task_specs import SimTaskSpec
 
 
@@ -16,6 +17,9 @@ class ConveyorPickObjectsInBinEvaluator:
 
     The bin interior comes from its collision geometry. Peak object count and
     ``ever_success`` remain latched for rollout progress and early stopping.
+    An object the task runtime removed for going off the track (parked past
+    ``REMOVED_OBJECT_MIN_X``) never counts, so success is out of reach once
+    one is gone and ``ever_failed`` latches.
     """
 
     def __init__(
@@ -51,6 +55,7 @@ class ConveyorPickObjectsInBinEvaluator:
         self._nworld = int(nworld)
         self._max_objects_in_bin = np.zeros((self._nworld,), dtype=np.int32)
         self._ever_success = np.zeros((self._nworld,), dtype=bool)
+        self._ever_failed = np.zeros((self._nworld,), dtype=bool)
 
     def configure_from_randomization(
         self,
@@ -224,11 +229,16 @@ class ConveyorPickObjectsInBinEvaluator:
             & (object_pos[..., 2] <= self._bin_rim_z)
         )
 
+        removed_mask = object_pos[..., 0] >= REMOVED_OBJECT_MIN_X
+        in_bin_mask &= ~removed_mask
+
         num_objects = in_bin_mask.sum(axis=1).astype(np.int32)
+        num_removed = removed_mask.sum(axis=1).astype(np.int32)
         total = len(self.object_names)
         self._max_objects_in_bin = np.maximum(self._max_objects_in_bin, num_objects)
         success = num_objects >= total
         self._ever_success |= success
+        self._ever_failed |= num_removed > 0
 
         objects_in_bin = [
             [name for name, inside in zip(self.object_names, world_mask) if bool(inside)]
@@ -242,8 +252,14 @@ class ConveyorPickObjectsInBinEvaluator:
                 "num_active_objects": np.full_like(num_objects, total),
                 "max_objects_in_bin_so_far": self._max_objects_in_bin.copy(),
                 "ever_success": self._ever_success.copy(),
+                "num_removed_objects": num_removed,
+                "ever_failed": self._ever_failed.copy(),
                 "object_in_bin_mask": in_bin_mask,
                 "objects_in_bin": objects_in_bin,
+                "removed_objects": [
+                    [name for name, removed in zip(self.object_names, world_mask) if bool(removed)]
+                    for world_mask in removed_mask
+                ],
                 "object_names": list(self.object_names),
                 "bin_x_bounds": list(self._bin_x_bounds),
                 "bin_y_bounds": list(self._bin_y_bounds),

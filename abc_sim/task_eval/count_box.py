@@ -18,6 +18,12 @@ class CountIntoOpaqueBoxEvaluator:
     ineligible objects in the geometry-derived interior. Success is not
     latched because a rollout may later overfill the box; ``ever_correct``
     records whether the count was ever right.
+
+    Reward counts up in equal steps, ``k / target_count`` for ``k`` eligible
+    objects in the box, and is 0 once the box holds more than
+    ``target_count`` eligible objects or any ineligible one: the box is
+    lidded, so neither can be taken back out, and over-counting must never
+    score like an honest partial count. Reward is 1 exactly on success.
     """
 
     def __init__(
@@ -256,14 +262,10 @@ class CountIntoOpaqueBoxEvaluator:
         success = (num_eligible_in == target) & (num_ineligible_in == 0)
         self._ever_correct |= success
 
-        # Progress: each eligible object toward the target earns credit; every
-        # object past it, and every off-directive object, costs the same.
-        overshoot = np.maximum(num_eligible_in - target, 0)
-        credit = np.minimum(num_eligible_in, target) - overshoot - num_ineligible_in
-        reward = np.clip(
-            credit.astype(np.float32) / float(max(target, 1)), 0.0, 1.0
-        )
-        reward = np.where(success, 1.0, np.minimum(reward, 0.99)).astype(np.float32)
+        violated = (num_eligible_in > target) | (num_ineligible_in > 0)
+        reward = np.where(
+            violated, 0.0, num_eligible_in.astype(np.float32) / float(max(target, 1))
+        ).astype(np.float32)
 
         in_box = [
             [name for name, is_in in zip(directive["names"], world) if bool(is_in)]
@@ -278,6 +280,7 @@ class CountIntoOpaqueBoxEvaluator:
                 "target_count": target,
                 "num_eligible_in_box": num_eligible_in,
                 "num_ineligible_in_box": num_ineligible_in,
+                "directive_violated": violated,
                 "objects_in_box": in_box,
                 # Final-state semantics: never stop a rollout early on a count
                 # that may still change, and let the last frame decide.
